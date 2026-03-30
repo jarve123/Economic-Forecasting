@@ -33,40 +33,58 @@ view(epl_shots)
 
 
 
+Here below, shows the situation XG for each match, on both home and away team.
 ```{r}
-library(tidyverse)
-
-# ── Step 1: Filter to 2016 onwards ────────────────────────────
-
-epl_shots_filtered <- epl_shots %>%
-  filter(season >= 2016)
-
-# Quick check
-epl_shots_filtered %>% count(season)
-
-# ── Step 2: Aggregate to match level ──────────────────────────
-# Keep match-level columns, sum xG per home/away team
-# Remove all shot-specific columns (minute, X, Y, player, etc.)
-
 match_xg <- epl_shots_filtered %>%
   group_by(match_id, league, season, date, home_team, away_team, home_goals, away_goals) %>%
   summarise(
-    home_xG = sum(xG[h_a == "h"], na.rm = TRUE),
-    away_xG = sum(xG[h_a == "a"], na.rm = TRUE),
+    # Total xG
+    home_xG             = sum(xG[h_a == "h"], na.rm = TRUE),
+    away_xG             = sum(xG[h_a == "a"], na.rm = TRUE),
+
+    # Open play xG
+    home_xG_openplay    = sum(xG[h_a == "h" & situation == "OpenPlay"], na.rm = TRUE),
+    away_xG_openplay    = sum(xG[h_a == "a" & situation == "OpenPlay"], na.rm = TRUE),
+
+    # From corner xG
+    home_xG_corner      = sum(xG[h_a == "h" & situation == "FromCorner"], na.rm = TRUE),
+    away_xG_corner      = sum(xG[h_a == "a" & situation == "FromCorner"], na.rm = TRUE),
+
+    # Direct free kick xG
+    home_xG_freekick    = sum(xG[h_a == "h" & situation == "DirectFreekick"], na.rm = TRUE),
+    away_xG_freekick    = sum(xG[h_a == "a" & situation == "DirectFreekick"], na.rm = TRUE),
+
+    # Penalty xG
+    home_xG_penalty     = sum(xG[h_a == "h" & situation == "Penalty"], na.rm = TRUE),
+    away_xG_penalty     = sum(xG[h_a == "a" & situation == "Penalty"], na.rm = TRUE),
+
+    # Set piece xG (indirect — headers from crosses etc.)
+    home_xG_setpiece    = sum(xG[h_a == "h" & situation == "SetPiece"], na.rm = TRUE),
+    away_xG_setpiece    = sum(xG[h_a == "a" & situation == "SetPiece"], na.rm = TRUE),
+
+    # All dead ball combined (corner + freekick + setpiece + penalty)
+    home_xG_deadball    = sum(xG[h_a == "h" & situation %in% c("FromCorner", "DirectFreekick", "SetPiece", "Penalty")], na.rm = TRUE),
+    away_xG_deadball    = sum(xG[h_a == "a" & situation %in% c("FromCorner", "DirectFreekick", "SetPiece", "Penalty")], na.rm = TRUE),
+
     .groups = "drop"
   ) %>%
   arrange(date)
 
-# Quick check
+# Sanity check — do the parts add up to the total?
+match_xg %>%
+  mutate(
+    home_check = round(home_xG_openplay + home_xG_deadball, 4) == round(home_xG, 4),
+    away_check = round(away_xG_openplay + away_xG_deadball, 4) == round(away_xG, 4)
+  ) %>%
+  summarise(
+    home_all_match = mean(home_check),
+    away_all_match = mean(away_check)
+  )
+
 glimpse(match_xg)
-head(match_xg,10)
 
-# How many matches per season?
-match_xg %>% count(season)
+saveRDS(match_xg, "epl_match_xg.rds")
 ```
-
-
-
 ```{r}
 view(match_xg)
 ```
@@ -74,10 +92,7 @@ view(match_xg)
 
 
 
-
-
-
-Til senere MÅSKE ALT UDNER
+Til senere MÅSKE, alt under
 
 
 
