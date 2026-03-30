@@ -14,3 +14,132 @@ library(tidyverse)
 library(lubridate)
 ```
 
+
+
+
+
+```{r}
+# This loads from a static file, much more reliable. This here is the main dataset
+epl_shots <- load_understat_league_shots(league = "EPL")
+
+glimpse(epl_shots)
+colnames(epl_shots)
+```
+
+```{r}
+view(epl_shots)
+```
+
+
+
+
+```{r}
+library(tidyverse)
+
+# ── Step 1: Filter to 2016 onwards ────────────────────────────
+
+epl_shots_filtered <- epl_shots %>%
+  filter(season >= 2016)
+
+# Quick check
+epl_shots_filtered %>% count(season)
+
+# ── Step 2: Aggregate to match level ──────────────────────────
+# Keep match-level columns, sum xG per home/away team
+# Remove all shot-specific columns (minute, X, Y, player, etc.)
+
+match_xg <- epl_shots_filtered %>%
+  group_by(match_id, league, season, date, home_team, away_team, home_goals, away_goals) %>%
+  summarise(
+    home_xG = sum(xG[h_a == "h"], na.rm = TRUE),
+    away_xG = sum(xG[h_a == "a"], na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(date)
+
+# Quick check
+glimpse(match_xg)
+head(match_xg,10)
+
+# How many matches per season?
+match_xg %>% count(season)
+```
+
+
+
+```{r}
+view(match_xg)
+```
+
+
+
+
+
+
+
+Til senere MÅSKE ALT UDNER
+
+
+
+```{r}
+fbref_seasons <- 2018:2025
+
+# ── 1. Defense stats ───────────────────────────────────────────
+
+defense_stats <- map_dfr(fbref_seasons, function(yr) {
+  message("Pulling defense stats: ", yr)
+  Sys.sleep(3)
+  tryCatch({
+    load_fb_big5_advanced_season_stats(
+      season_end_year = yr,
+      stat_type       = "defense",
+      team_or_player  = "team"
+    ) %>%
+      filter(Comp == "Premier League") %>%
+      mutate(season_end = yr)
+  }, error = function(e) {
+    message("  Failed for: ", yr, " — ", e$message)
+    NULL
+  })
+})
+
+saveRDS(defense_stats, "epl_defense_stats.rds")
+message("Saved: epl_defense_stats.rds — ", nrow(defense_stats), " rows")
+
+# ── 2. Keeper stats ────────────────────────────────────────────
+
+keeper_stats <- map_dfr(fbref_seasons, function(yr) {
+  message("Pulling keeper stats: ", yr)
+  Sys.sleep(3)
+  tryCatch({
+    load_fb_big5_advanced_season_stats(
+      season_end_year = yr,
+      stat_type       = "keepers_adv",
+      team_or_player  = "player"
+    ) %>%
+      filter(Comp == "Premier League") %>%
+      mutate(season_end = yr)
+  }, error = function(e) {
+    message("  Failed for: ", yr, " — ", e$message)
+    NULL
+  })
+})
+
+saveRDS(keeper_stats, "epl_keeper_stats.rds")
+message("Saved: epl_keeper_stats.rds — ", nrow(keeper_stats), " rows")
+
+# ── Quick check ────────────────────────────────────────────────
+glimpse(defense_stats)
+glimpse(keeper_stats)
+```
+```{r}
+view(defense_stats)
+view(keeper_stats)
+```
+
+```{r}
+# Check earliest and latest season in shots data
+epl_shots %>% count(season) %>% print(n = 30)
+```
+
+
