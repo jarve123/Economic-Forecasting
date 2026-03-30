@@ -15,7 +15,7 @@ library(readr)
 library(dplyr)
 library(purrr)
 library(stringr)
-library(lubridate)
+library(zoo)
 ```
 
 Read files
@@ -36,12 +36,16 @@ files <- c(
 Add variable: season
 ```{r}
 pl_raw <- map_dfr(files, function(file) {
-  read_csv(file, show_col_types = FALSE) %>%
+  read_csv(
+    file,
+    col_types = cols(Date = col_character()),
+    show_col_types = FALSE
+  ) %>%
     mutate(season = str_remove(file, "\\.csv$"))
 })
 ```
 
-Choose variables from data set
+Select variables
 ```{r}
 pl <- pl_raw %>%
   select(
@@ -53,7 +57,7 @@ pl <- pl_raw %>%
   mutate(Date = trimws(Date))
 ```
 
-Make real dates
+Parse dates
 ```{r}
 pl$Date <- ifelse(
   nchar(pl$Date) == 8,
@@ -70,7 +74,7 @@ pl <- pl %>%
   arrange(Date)
 ```
 
-Create readable variable
+Create match_result
 ```{r}
 pl <- pl %>%
   mutate(
@@ -83,20 +87,8 @@ pl <- pl %>%
   )
 table(pl$match_result, useNA = "ifany")
 ```
-Create numerical variable for result
-```{r}
-pl <- pl %>%
-  mutate(
-    result_num = case_when(
-      FTR == "H" ~ 1,
-      FTR == "D" ~ 0,
-      FTR == "A" ~ -1,
-      TRUE ~ NA_real_
-    )
-  )
-```
 
-Create total goals
+Create total_goals
 ```{r}
 pl <- pl %>%
   mutate(
@@ -105,7 +97,7 @@ pl <- pl %>%
 summary(pl$total_goals)
 ```
 
-Indicator for over 2.5 goals
+Create over_2_5
 ```{r}
 pl <- pl %>%
   mutate(
@@ -124,7 +116,7 @@ pl <- pl %>%
   )
 ```
 
-Adjusting for bookmaker margin
+Adjust for bookmaker margin
 ```{r}
 pl <- pl %>%
   mutate(
@@ -136,7 +128,7 @@ pl <- pl %>%
 summary(pl$prob_sum)
 summary(pl$p_home + pl$p_draw + pl$p_away)
 ```
-Create binary home team variable
+Create binary home team variable, home_win
 ```{r}
 pl <- pl %>%
   mutate(
@@ -187,5 +179,98 @@ pl %>%
     avg_book_prob = mean(p_home, na.rm = TRUE),
     actual_home_win = mean(home_win, na.rm = TRUE)
   )
+```
+Define log_loss and brier_score and full-sample bookmaker benchmark
+```{r}
+log_loss <- function(actual, p) {
+  keep <- !is.na(actual) & !is.na(p)
+  actual <- actual[keep]
+  p <- p[keep]
+  p <- pmin(pmax(p, 1e-15), 1 - 1e-15)
+  -mean(actual * log(p) + (1 - actual) * log(1 - p))
+}
+
+brier_score <- function(actual, p) {
+  keep <- !is.na(actual) & !is.na(p)
+  actual <- actual[keep]
+  p <- p[keep]
+  mean((actual - p)^2)
+}
+
+log_loss(pl$home_win, pl$p_home)
+brier_score(pl$home_win, pl$p_home)
+```
+
+Rolling average of home goals in previous home matches
+Note: This variable measures the average number of goals scored by the home team in its previous five home matches. It is included only as a simple exploratory benchmark feature and not as our final preferred measure of team strength.
+```{r}
+pl <- pl %>%
+  group_by(HomeTeam) %>%
+  arrange(Date, .by_group = TRUE) %>%
+  mutate(
+    home_goals_avg = lag(rollapply(FTHG, 5, mean, fill = NA, align = "right"))
+  ) %>%
+  ungroup()
+
+head(pl %>% select(Date, HomeTeam, FTHG, home_goals_avg), 15)
+summary(pl$home_goals_avg)
+```
+Train/test split
+```{r}
+train <- pl %>%
+  filter(Date < as.Date("2023-08-01"))
+
+test <- pl %>%
+  filter(Date >= as.Date("2023-08-01"))
+
+sum(is.na(train$home_goals_avg))
+sum(is.na(test$home_goals_avg))
+```
+
+Evaluating bookmaker in test sample to get out-of-sample baseline
+```{r}
+log_loss(test$home_win, test$p_home)
+brier_score(test$home_win, test$p_home)
+```
+
+Logit model for train data
+```{r}
+model_logit <- glm(
+  home_win ~ p_home + p_draw + p_away,
+  data = train,
+  family = binomial
+)
+```
+
+Predictions on test
+```{r}
+test$pred_logit <- predict(model_logit, newdata = test, type = "response")
+
+log_loss(test$home_win, test$pred_logit)
+brier_score(test$home_win, test$pred_logit)
+```
+
+Simple model with extra info
+```{r}
+model_extended <- glm(
+  home_win ~ p_home + home_goals_avg,
+  data = train %>% filter(!is.na(home_goals_avg)),
+  family = binomial
+)
+```
+
+Predictions on test
+```{r}
+test_eval <- test %>%
+  filter(!is.na(home_goals_avg)) %>%
+  mutate(
+    pred_extended = predict(model_extended, newdata = ., type = "response")
+  )
+```
+
+Evaluate the model
+```{r}
+log_loss(test_eval$home_win, test_eval$pred_extended)
+brier_score(test_eval$home_win, test_eval$pred_extended)
 ```
 
