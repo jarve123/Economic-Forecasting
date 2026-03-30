@@ -1,0 +1,191 @@
+---
+title: "Data prep"
+author: "Jonathan Arve Thomsen"
+date: "2026-03-30"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Load packages
+```{r}
+library(readr)
+library(dplyr)
+library(purrr)
+library(stringr)
+library(lubridate)
+```
+
+Read files
+```{r}
+files <- c(
+  "PL 16-17.csv",
+  "PL 17-18.csv",
+  "PL 18-19.csv",
+  "PL 19-20.csv",
+  "PL 20-21.csv",
+  "PL 21-22.csv",
+  "PL 22-23.csv",
+  "PL 23-24.csv",
+  "PL 24-25.csv"
+)
+```
+
+Add variable: season
+```{r}
+pl_raw <- map_dfr(files, function(file) {
+  read_csv(file, show_col_types = FALSE) %>%
+    mutate(season = str_remove(file, "\\.csv$"))
+})
+```
+
+Choose variables from data set
+```{r}
+pl <- pl_raw %>%
+  select(
+    Date, HomeTeam, AwayTeam,
+    FTHG, FTAG, FTR,
+    B365H, B365D, B365A,
+    season
+  ) %>%
+  mutate(Date = trimws(Date))
+```
+
+Make real dates
+```{r}
+pl$Date <- ifelse(
+  nchar(pl$Date) == 8,
+  as.character(as.Date(pl$Date, format = "%d/%m/%y")),
+  as.character(as.Date(pl$Date, format = "%d/%m/%Y"))
+)
+
+pl$Date <- as.Date(pl$Date)
+```
+
+Sort data set by date
+```{r}
+pl <- pl %>%
+  arrange(Date)
+```
+
+Create readable variable
+```{r}
+pl <- pl %>%
+  mutate(
+    match_result = case_when(
+      FTR == "H" ~ "HomeWin",
+      FTR == "D" ~ "Draw",
+      FTR == "A" ~ "AwayWin",
+      TRUE ~ NA_character_
+    )
+  )
+table(pl$match_result, useNA = "ifany")
+```
+Create numerical variable for result
+```{r}
+pl <- pl %>%
+  mutate(
+    result_num = case_when(
+      FTR == "H" ~ 1,
+      FTR == "D" ~ 0,
+      FTR == "A" ~ -1,
+      TRUE ~ NA_real_
+    )
+  )
+```
+
+Create total goals
+```{r}
+pl <- pl %>%
+  mutate(
+    total_goals = FTHG + FTAG
+  )
+summary(pl$total_goals)
+```
+
+Indicator for over 2.5 goals
+```{r}
+pl <- pl %>%
+  mutate(
+    over_2_5 = ifelse(total_goals > 2.5, 1, 0)
+  )
+table(pl$over_2_5, useNA = "ifany")
+prop.table(table(pl$over_2_5))
+```
+Create bookmaker implied probabilities
+```{r}
+pl <- pl %>%
+  mutate(
+    p_home_raw = 1 / B365H,
+    p_draw_raw = 1 / B365D,
+    p_away_raw = 1 / B365A
+  )
+```
+
+Adjusting for bookmaker margin
+```{r}
+pl <- pl %>%
+  mutate(
+    prob_sum = p_home_raw + p_draw_raw + p_away_raw,
+    p_home = p_home_raw / prob_sum,
+    p_draw = p_draw_raw / prob_sum,
+    p_away = p_away_raw / prob_sum
+  )
+summary(pl$prob_sum)
+summary(pl$p_home + pl$p_draw + pl$p_away)
+```
+Create binary home team variable
+```{r}
+pl <- pl %>%
+  mutate(
+    home_win = ifelse(FTR == "H", 1, 0)
+  )
+```
+
+Filter out NA rows
+```{r}
+pl <- pl %>%
+  filter(
+    !is.na(Date),
+    !is.na(HomeTeam),
+    !is.na(AwayTeam),
+    !is.na(FTHG),
+    !is.na(FTAG),
+    !is.na(FTR),
+    !is.na(B365H),
+    !is.na(B365D),
+    !is.na(B365A)
+  )
+```
+
+Descriptive statistics per season
+```{r}
+pl %>%
+  group_by(season) %>%
+  summarise(
+    matches = n(),
+    avg_goals = mean(total_goals, na.rm = TRUE),
+    home_win_rate = mean(home_win, na.rm = TRUE),
+    over25_rate = mean(over_2_5, na.rm = TRUE)
+  )
+```
+Bookmaker benchmark
+```{r}
+pl %>%
+  mutate(
+    home_prob_bucket = cut(
+      p_home,
+      breaks = c(0, 0.3, 0.5, 0.7, 1),
+      include.lowest = TRUE
+    )
+  ) %>%
+  group_by(home_prob_bucket) %>%
+  summarise(
+    n = n(),
+    avg_book_prob = mean(p_home, na.rm = TRUE),
+    actual_home_win = mean(home_win, na.rm = TRUE)
+  )
+```
+
