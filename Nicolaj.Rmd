@@ -15,6 +15,9 @@ library(lubridate)
 ```
 
 
+```{r}
+rm(list=ls())
+```
 
 
 
@@ -32,45 +35,55 @@ view(epl_shots)
 
 
 
-
 Here below, shows the situation XG for each match, on both home and away team.
 ```{r}
-match_xg <- epl_shots_filtered %>%
+match_xg <- epl_shots %>%
+  filter(season >= 2016, season <= 2024) %>%
+  mutate(h_a = coalesce(h_a, home_away)) %>%  # fill NA h_a from home_away
   group_by(match_id, league, season, date, home_team, away_team, home_goals, away_goals) %>%
   summarise(
     # Total xG
-    home_xG             = sum(xG[h_a == "h"], na.rm = TRUE),
-    away_xG             = sum(xG[h_a == "a"], na.rm = TRUE),
+    home_xG          = sum(xG[h_a == "h"], na.rm = TRUE),
+    away_xG          = sum(xG[h_a == "a"], na.rm = TRUE),
 
     # Open play xG
-    home_xG_openplay    = sum(xG[h_a == "h" & situation == "OpenPlay"], na.rm = TRUE),
-    away_xG_openplay    = sum(xG[h_a == "a" & situation == "OpenPlay"], na.rm = TRUE),
+    home_xG_openplay = sum(xG[h_a == "h" & situation == "OpenPlay"], na.rm = TRUE),
+    away_xG_openplay = sum(xG[h_a == "a" & situation == "OpenPlay"], na.rm = TRUE),
 
     # From corner xG
-    home_xG_corner      = sum(xG[h_a == "h" & situation == "FromCorner"], na.rm = TRUE),
-    away_xG_corner      = sum(xG[h_a == "a" & situation == "FromCorner"], na.rm = TRUE),
+    home_xG_corner   = sum(xG[h_a == "h" & situation == "FromCorner"], na.rm = TRUE),
+    away_xG_corner   = sum(xG[h_a == "a" & situation == "FromCorner"], na.rm = TRUE),
 
     # Direct free kick xG
-    home_xG_freekick    = sum(xG[h_a == "h" & situation == "DirectFreekick"], na.rm = TRUE),
-    away_xG_freekick    = sum(xG[h_a == "a" & situation == "DirectFreekick"], na.rm = TRUE),
+    home_xG_freekick = sum(xG[h_a == "h" & situation == "DirectFreekick"], na.rm = TRUE),
+    away_xG_freekick = sum(xG[h_a == "a" & situation == "DirectFreekick"], na.rm = TRUE),
 
     # Penalty xG
-    home_xG_penalty     = sum(xG[h_a == "h" & situation == "Penalty"], na.rm = TRUE),
-    away_xG_penalty     = sum(xG[h_a == "a" & situation == "Penalty"], na.rm = TRUE),
+    home_xG_penalty  = sum(xG[h_a == "h" & situation == "Penalty"], na.rm = TRUE),
+    away_xG_penalty  = sum(xG[h_a == "a" & situation == "Penalty"], na.rm = TRUE),
 
-    # Set piece xG (indirect — headers from crosses etc.)
-    home_xG_setpiece    = sum(xG[h_a == "h" & situation == "SetPiece"], na.rm = TRUE),
-    away_xG_setpiece    = sum(xG[h_a == "a" & situation == "SetPiece"], na.rm = TRUE),
+    # Set piece xG (indirect)
+    home_xG_setpiece = sum(xG[h_a == "h" & situation == "SetPiece"], na.rm = TRUE),
+    away_xG_setpiece = sum(xG[h_a == "a" & situation == "SetPiece"], na.rm = TRUE),
 
-    # All dead ball combined (corner + freekick + setpiece + penalty)
-    home_xG_deadball    = sum(xG[h_a == "h" & situation %in% c("FromCorner", "DirectFreekick", "SetPiece", "Penalty")], na.rm = TRUE),
-    away_xG_deadball    = sum(xG[h_a == "a" & situation %in% c("FromCorner", "DirectFreekick", "SetPiece", "Penalty")], na.rm = TRUE),
+    # All dead ball combined
+    home_xG_deadball = sum(xG[h_a == "h" & situation != "OpenPlay"], na.rm = TRUE),
+    away_xG_deadball = sum(xG[h_a == "a" & situation != "OpenPlay"], na.rm = TRUE),
 
     .groups = "drop"
   ) %>%
   arrange(date)
 
-# Sanity check — do the parts add up to the total?
+# Verify all seasons now have xG
+match_xg %>%
+  group_by(season) %>%
+  summarise(
+    matches      = n(),
+    mean_home_xG = round(mean(home_xG), 3),
+    mean_away_xG = round(mean(away_xG), 3)
+  )
+
+# Sanity check
 match_xg %>%
   mutate(
     home_check = round(home_xG_openplay + home_xG_deadball, 4) == round(home_xG, 4),
@@ -80,8 +93,6 @@ match_xg %>%
     home_all_match = mean(home_check),
     away_all_match = mean(away_check)
   )
-
-glimpse(match_xg)
 
 saveRDS(match_xg, "epl_match_xg.rds")
 ```
