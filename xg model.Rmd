@@ -377,4 +377,8 @@ test_xg_diff_eval_10 <- test_xg %>%
 log_loss(test_xg_diff_eval_10$home_win, test_xg_diff_eval_10$pred_xg_diff_10)
 brier_score(test_xg_diff_eval_10$home_win, test_xg_diff_eval_10$pred_xg_diff_10)
 ```
-
+# Summary:
+# Adding xG-based features does not improve predictive performance
+# relative to bookmaker probabilities.
+# This suggests that bookmaker odds already incorporate publicly available
+# performance metrics such as expected goals.
