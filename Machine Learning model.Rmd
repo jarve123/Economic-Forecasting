@@ -1,0 +1,430 @@
+---
+title: "Machine Learning model"
+output: html_document
+date: "2026-03-30"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(zoo)
+library(corrplot)
+library(poissonreg)  # Poisson model
+library(xgboost)
+library(caret)
+
+# ── Step 1: Create target + rolling features ──────────────────
+
+model_df <- match_xg %>%
+  mutate(total_goals = home_goals + away_goals) %>%
+  # Reshape to team level so rolling averages are per team
+  # Home perspective
+  bind_rows(
+    match_xg %>% transmute(
+      match_id, season, date,
+      team        = home_team,
+      opponent    = away_team,
+      home_away   = "home",
+      total_goals = home_goals + away_goals,
+      xG_openplay = home_xG_openplay,
+      xG_corner   = home_xG_corner,
+      xG_freekick = home_xG_freekick,
+      xG_penalty  = home_xG_penalty,
+      xG_setpiece = home_xG_setpiece
+    ),
+    match_xg %>% transmute(
+      match_id, season, date,
+      team        = away_team,
+      opponent    = home_team,
+      home_away   = "away",
+      total_goals = home_goals + away_goals,
+      xG_openplay = away_xG_openplay,
+      xG_corner   = away_xG_corner,
+      xG_freekick = away_xG_freekick,
+      xG_penalty  = away_xG_penalty,
+      xG_setpiece = away_xG_setpiece
+    )
+  ) %>%
+  arrange(team, date)
+
+# ── Step 2: Rolling 5-game averages (lagged to avoid leakage) ─
+
+model_df <- model_df %>%
+  group_by(team) %>%
+  mutate(
+    roll_xG_openplay = lag(rollmean(xG_openplay, 5, fill = NA, align = "right"), 1),
+    roll_xG_corner   = lag(rollmean(xG_corner,   5, fill = NA, align = "right"), 1),
+    roll_xG_freekick = lag(rollmean(xG_freekick, 5, fill = NA, align = "right"), 1),
+    roll_xG_penalty  = lag(rollmean(xG_penalty,  5, fill = NA, align = "right"), 1),
+    roll_xG_setpiece = lag(rollmean(xG_setpiece, 5, fill = NA, align = "right"), 1)
+  ) %>%
+  ungroup()
+
+# ── Step 3: Join home and away team features per match ─────────
+
+home_features <- model_df %>%
+  filter(home_away == "home") %>%
+  select(match_id, date, season, total_goals,
+         home_roll_xG_openplay = roll_xG_openplay,
+         home_roll_xG_corner   = roll_xG_corner,
+         home_roll_xG_freekick = roll_xG_freekick,
+         home_roll_xG_penalty  = roll_xG_penalty,
+         home_roll_xG_setpiece = roll_xG_setpiece)
+
+away_features <- model_df %>%
+  filter(home_away == "away") %>%
+  select(match_id,
+         away_roll_xG_openplay = roll_xG_openplay,
+         away_roll_xG_corner   = roll_xG_corner,
+         away_roll_xG_freekick = roll_xG_freekick,
+         away_roll_xG_penalty  = roll_xG_penalty,
+         away_roll_xG_setpiece = roll_xG_setpiece)
+
+final_df <- home_features %>%
+  left_join(away_features, by = "match_id") %>%
+  drop_na()
+
+# How many rows after dropping NA from rolling window?
+nrow(final_df)
+
+# ── Step 4: Check multicollinearity ───────────────────────────
+
+feature_cols <- final_df %>%
+  select(starts_with("home_roll"), starts_with("away_roll"))
+
+# Correlation matrix
+cor_matrix <- cor(feature_cols)
+corrplot(cor_matrix, method = "number", type = "upper", 
+         tl.cex = 0.7, number.cex = 0.7)
+
+# Any correlations above 0.8?
+high_cor <- which(abs(cor_matrix) > 0.8 & cor_matrix != 1, arr.ind = TRUE)
+if (nrow(high_cor) > 0) {
+  cat("High correlations found:\n")
+  print(high_cor)
+} else {
+  cat("No high correlations — safe to proceed\n")
+}
+```
+
+
+
+
+```{r}
+library(tidyverse)
+library(zoo)
+library(corrplot)
+library(xgboost)
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 1: LOAD DATA
+# ═══════════════════════════════════════════════════════════════
+
+epl_shots <- load_understat_league_shots(league = "EPL")
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 2: AGGREGATE TO MATCH LEVEL WITH xG BY SITUATION
+# ═══════════════════════════════════════════════════════════════
+
+match_xg <- epl_shots %>%
+  filter(season >= 2016, season <= 2024) %>%
+  mutate(h_a = coalesce(h_a, home_away)) %>%
+  group_by(match_id, league, season, date, home_team, away_team, home_goals, away_goals) %>%
+  summarise(
+    # Total xG
+    home_xG          = sum(xG[h_a == "h"], na.rm = TRUE),
+    away_xG          = sum(xG[h_a == "a"], na.rm = TRUE),
+
+    # Open play xG
+    home_xG_openplay = sum(xG[h_a == "h" & situation == "OpenPlay"], na.rm = TRUE),
+    away_xG_openplay = sum(xG[h_a == "a" & situation == "OpenPlay"], na.rm = TRUE),
+
+    # From corner xG
+    home_xG_corner   = sum(xG[h_a == "h" & situation == "FromCorner"], na.rm = TRUE),
+    away_xG_corner   = sum(xG[h_a == "a" & situation == "FromCorner"], na.rm = TRUE),
+
+    # Direct free kick xG
+    home_xG_freekick = sum(xG[h_a == "h" & situation == "DirectFreekick"], na.rm = TRUE),
+    away_xG_freekick = sum(xG[h_a == "a" & situation == "DirectFreekick"], na.rm = TRUE),
+
+    # Penalty xG
+    home_xG_penalty  = sum(xG[h_a == "h" & situation == "Penalty"], na.rm = TRUE),
+    away_xG_penalty  = sum(xG[h_a == "a" & situation == "Penalty"], na.rm = TRUE),
+
+    # Set piece xG (indirect)
+    home_xG_setpiece = sum(xG[h_a == "h" & situation == "SetPiece"], na.rm = TRUE),
+    away_xG_setpiece = sum(xG[h_a == "a" & situation == "SetPiece"], na.rm = TRUE),
+
+    # All dead ball combined
+    home_xG_deadball = sum(xG[h_a == "h" & situation != "OpenPlay"], na.rm = TRUE),
+    away_xG_deadball = sum(xG[h_a == "a" & situation != "OpenPlay"], na.rm = TRUE),
+
+    .groups = "drop"
+  ) %>%
+  arrange(date)
+
+saveRDS(match_xg, "epl_match_xg.rds")
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 3: RESHAPE TO TEAM LEVEL + ROLLING AVERAGES
+# ═══════════════════════════════════════════════════════════════
+
+# Reshape so each row = one team in one match
+model_df <- bind_rows(
+  match_xg %>% transmute(
+    match_id, season, date,
+    team      = home_team,
+    opponent  = away_team,
+    home_away = "home",
+    goals     = home_goals,
+    xG_openplay = home_xG_openplay,
+    xG_corner   = home_xG_corner,
+    xG_freekick = home_xG_freekick,
+    xG_penalty  = home_xG_penalty,
+    xG_setpiece = home_xG_setpiece
+  ),
+  match_xg %>% transmute(
+    match_id, season, date,
+    team      = away_team,
+    opponent  = home_team,
+    home_away = "away",
+    goals     = away_goals,
+    xG_openplay = away_xG_openplay,
+    xG_corner   = away_xG_corner,
+    xG_freekick = away_xG_freekick,
+    xG_penalty  = away_xG_penalty,
+    xG_setpiece = away_xG_setpiece
+  )
+) %>%
+  arrange(team, date)
+
+# Rolling 5-game averages — lagged by 1 to avoid data leakage
+model_df <- model_df %>%
+  group_by(team) %>%
+  mutate(
+    roll_xG_openplay = lag(rollmean(xG_openplay, 5, fill = NA, align = "right"), 1),
+    roll_xG_corner   = lag(rollmean(xG_corner,   5, fill = NA, align = "right"), 1),
+    roll_xG_freekick = lag(rollmean(xG_freekick, 5, fill = NA, align = "right"), 1),
+    roll_xG_penalty  = lag(rollmean(xG_penalty,  5, fill = NA, align = "right"), 1),
+    roll_xG_setpiece = lag(rollmean(xG_setpiece, 5, fill = NA, align = "right"), 1)
+  ) %>%
+  ungroup()
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 4: BUILD FINAL MODELLING DATAFRAME
+# ═══════════════════════════════════════════════════════════════
+
+# Each row = one team's goals in one match
+# Own rolling xG = attacking signal
+# Opponent rolling xG = proxy for defensive weakness
+
+team_match_df <- model_df %>%
+  # Join opponent rolling stats
+  left_join(
+    model_df %>%
+      select(
+        match_id,
+        opponent            = team,
+        opp_roll_xG_openplay = roll_xG_openplay,
+        opp_roll_xG_corner   = roll_xG_corner,
+        opp_roll_xG_freekick = roll_xG_freekick,
+        opp_roll_xG_penalty  = roll_xG_penalty,
+        opp_roll_xG_setpiece = roll_xG_setpiece
+      ),
+    by = c("match_id", "opponent")
+  ) %>%
+  mutate(home_flag = if_else(home_away == "home", 1, 0)) %>%
+  select(
+    match_id, season, date, team, opponent, home_away, home_flag, goals,
+    roll_xG_openplay, roll_xG_corner, roll_xG_freekick,
+    roll_xG_penalty,  roll_xG_setpiece,
+    opp_roll_xG_openplay, opp_roll_xG_corner, opp_roll_xG_freekick,
+    opp_roll_xG_penalty,  opp_roll_xG_setpiece
+  ) %>%
+  drop_na() %>%
+  arrange(date)
+
+cat("Final modelling rows:", nrow(team_match_df), "\n")
+cat("Seasons:", paste(unique(team_match_df$season), collapse = ", "), "\n")
+
+saveRDS(team_match_df, "epl_team_match_df.rds")
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 5: MULTICOLLINEARITY CHECK
+# ═══════════════════════════════════════════════════════════════
+
+feature_cols <- team_match_df %>%
+  select(
+    roll_xG_openplay, roll_xG_corner, roll_xG_freekick,
+    roll_xG_penalty,  roll_xG_setpiece,
+    opp_roll_xG_openplay, opp_roll_xG_corner, opp_roll_xG_freekick,
+    opp_roll_xG_penalty,  opp_roll_xG_setpiece
+  )
+
+cor_matrix <- cor(feature_cols)
+corrplot(cor_matrix, method = "number", type = "upper",
+         tl.cex = 0.7, number.cex = 0.7,
+         title = "Feature Correlation Matrix")
+
+high_cor <- which(abs(cor_matrix) > 0.8 & cor_matrix != 1, arr.ind = TRUE)
+if (nrow(high_cor) > 0) {
+  cat("High correlations found:\n")
+  print(high_cor)
+} else {
+  cat("No high correlations — safe to proceed\n")
+}
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 6: TRAIN / TEST SPLIT
+# Always split by time — never random for time series data
+# ═══════════════════════════════════════════════════════════════
+
+train_df <- team_match_df %>% filter(season <= 2022)
+test_df  <- team_match_df %>% filter(season >= 2023)
+
+cat("Train rows:", nrow(train_df), "| Seasons:", min(train_df$season), "-", max(train_df$season), "\n")
+cat("Test rows: ", nrow(test_df),  "| Seasons:", min(test_df$season),  "-", max(test_df$season),  "\n")
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 7: POISSON REGRESSION
+# ═══════════════════════════════════════════════════════════════
+
+poisson_model <- glm(
+  goals ~
+    roll_xG_openplay + roll_xG_corner + roll_xG_freekick +
+    roll_xG_penalty  + roll_xG_setpiece +
+    opp_roll_xG_openplay + opp_roll_xG_corner + opp_roll_xG_freekick +
+    opp_roll_xG_penalty  + opp_roll_xG_setpiece +
+    home_flag,
+  data   = train_df,
+  family = poisson(link = "log")
+)
+
+summary(poisson_model)
+
+test_df <- test_df %>%
+  mutate(pred_poisson = predict(poisson_model, newdata = test_df, type = "response"))
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 8: XGBOOST
+# ═══════════════════════════════════════════════════════════════
+
+feature_names <- c(
+  "roll_xG_openplay", "roll_xG_corner", "roll_xG_freekick",
+  "roll_xG_penalty",  "roll_xG_setpiece",
+  "opp_roll_xG_openplay", "opp_roll_xG_corner", "opp_roll_xG_freekick",
+  "opp_roll_xG_penalty",  "opp_roll_xG_setpiece",
+  "home_flag"
+)
+
+train_matrix <- xgb.DMatrix(
+  data  = as.matrix(train_df[, feature_names]),
+  label = train_df$goals
+)
+
+test_matrix <- xgb.DMatrix(
+  data  = as.matrix(test_df[, feature_names]),
+  label = test_df$goals
+)
+
+xgb_model <- xgb.train(
+  params = list(
+    objective        = "count:poisson",
+    eta              = 0.05,
+    max_depth        = 4,
+    subsample        = 0.8,
+    colsample_bytree = 0.8
+  ),
+  data                  = train_matrix,
+  nrounds               = 500,
+  evals                 = list(train = train_matrix, test = test_matrix),
+  early_stopping_rounds = 30,
+  verbose               = 1,
+  print_every_n         = 50
+)
+
+test_df <- test_df %>%
+  mutate(pred_xgb = predict(xgb_model, test_matrix))
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 9: EVALUATE
+# ═══════════════════════════════════════════════════════════════
+
+results <- test_df %>%
+  summarise(
+    rmse_poisson = sqrt(mean((goals - pred_poisson)^2)),
+    rmse_xgb     = sqrt(mean((goals - pred_xgb)^2)),
+    mae_poisson  = mean(abs(goals - pred_poisson)),
+    mae_xgb      = mean(abs(goals - pred_xgb)),
+    bias_poisson = mean(pred_poisson - goals),
+    bias_xgb     = mean(pred_xgb     - goals)
+  )
+
+cat("\n=== Model Evaluation ===\n")
+print(results)
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 10: FEATURE IMPORTANCE
+# ═══════════════════════════════════════════════════════════════
+
+importance <- xgb.importance(feature_names = feature_names, model = xgb_model)
+xgb.plot.importance(importance, top_n = 11)
+print(importance)
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 11: DISTRIBUTION CHECK
+# ═══════════════════════════════════════════════════════════════
+
+test_df %>%
+  count(goals) %>%
+  mutate(pct_actual = round(n / sum(n), 3)) %>%
+  left_join(
+    test_df %>%
+      mutate(pred_rounded_poisson = round(pred_poisson)) %>%
+      count(pred_rounded_poisson) %>%
+      mutate(pct_poisson = round(n / sum(n), 3)) %>%
+      rename(goals = pred_rounded_poisson),
+    by = "goals"
+  ) %>%
+  left_join(
+    test_df %>%
+      mutate(pred_rounded_xgb = round(pred_xgb)) %>%
+      count(pred_rounded_xgb) %>%
+      mutate(pct_xgb = round(n / sum(n), 3)) %>%
+      rename(goals = pred_rounded_xgb),
+    by = "goals"
+  ) %>%
+  print()
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 12: VISUALISE
+# ═══════════════════════════════════════════════════════════════
+
+test_df %>%
+  select(goals, pred_poisson, pred_xgb) %>%
+  pivot_longer(-goals, names_to = "model", values_to = "predicted") %>%
+  ggplot(aes(x = goals, y = predicted, color = model)) +
+  geom_jitter(alpha = 0.3, width = 0.1) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  facet_wrap(~model) +
+  labs(
+    title = "Predicted vs Actual Goals (Per Team Per Match)",
+    x     = "Actual Goals",
+    y     = "Predicted Goals"
+  ) +
+  theme_minimal()
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 13: SAVE
+# ═══════════════════════════════════════════════════════════════
+
+saveRDS(poisson_model,  "poisson_model.rds")
+saveRDS(test_df,        "test_predictions.rds")
+xgb.save(xgb_model,    "xgb_model.ubj")
+
+cat("\n=== All models saved ===\n")
+```
+
