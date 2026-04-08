@@ -308,9 +308,7 @@ summary(poisson_model)
 test_df <- test_df %>%
   mutate(pred_poisson = predict(poisson_model, newdata = test_df, type = "response"))
 
-# ═══════════════════════════════════════════════════════════════
-# STEP 8: XGBOOST
-# ═══════════════════════════════════════════════════════════════
+# step 8── XGBoost fix — create train matrix first ───────────────────
 
 feature_names <- c(
   "roll_xG_openplay", "roll_xG_corner", "roll_xG_freekick",
@@ -349,9 +347,7 @@ xgb_model <- xgb.train(
 test_df <- test_df %>%
   mutate(pred_xgb = predict(xgb_model, test_matrix))
 
-# ═══════════════════════════════════════════════════════════════
-# STEP 9: EVALUATE
-# ═══════════════════════════════════════════════════════════════
+#step 9 ── Evaluate ──────────────────────────────────────────────────
 
 results <- test_df %>%
   summarise(
@@ -366,17 +362,13 @@ results <- test_df %>%
 cat("\n=== Model Evaluation ===\n")
 print(results)
 
-# ═══════════════════════════════════════════════════════════════
-# STEP 10: FEATURE IMPORTANCE
-# ═══════════════════════════════════════════════════════════════
+#  step 10── Feature importance ────────────────────────────────────────
 
 importance <- xgb.importance(feature_names = feature_names, model = xgb_model)
 xgb.plot.importance(importance, top_n = 11)
 print(importance)
 
-# ═══════════════════════════════════════════════════════════════
-# STEP 11: DISTRIBUTION CHECK
-# ═══════════════════════════════════════════════════════════════
+# step 11── Distribution check ────────────────────────────────────────
 
 test_df %>%
   count(goals) %>%
@@ -399,9 +391,7 @@ test_df %>%
   ) %>%
   print()
 
-# ═══════════════════════════════════════════════════════════════
-# STEP 12: VISUALISE
-# ═══════════════════════════════════════════════════════════════
+# step 12── Visualise ─────────────────────────────────────────────────
 
 test_df %>%
   select(goals, pred_poisson, pred_xgb) %>%
@@ -417,14 +407,954 @@ test_df %>%
   ) +
   theme_minimal()
 
-# ═══════════════════════════════════════════════════════════════
-# STEP 13: SAVE
-# ═══════════════════════════════════════════════════════════════
+# ── Save ──────────────────────────────────────────────────────
 
-saveRDS(poisson_model,  "poisson_model.rds")
-saveRDS(test_df,        "test_predictions.rds")
-xgb.save(xgb_model,    "xgb_model.ubj")
+saveRDS(poisson_model, "poisson_model.rds")
+saveRDS(test_df,       "test_predictions.rds")
+xgb.save(xgb_model,   "xgb_model.ubj")
 
 cat("\n=== All models saved ===\n")
 ```
 
+FROM UNDER HERE WE NOW use A EXPONENTIALLY WEIAGHTED MEAN and USE A NEGATIVE BINOMIAL IN ORDER TO SEE IF THE VARIANCE CAN NOT BE SUPPRESED:
+Furthermore a standrad deviation is added to the xg of 5 prior matches
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```{r}
+library(worldfootballR)
+library(tidyverse)
+library(zoo)
+library(corrplot)
+library(xgboost)
+library(MASS)
+
+select <- dplyr::select
+filter <- dplyr::filter
+# ═══════════════════════════════════════════════════════════════
+# STEP 1: LOAD DATA
+# ═══════════════════════════════════════════════════════════════
+
+epl_shots <- load_understat_league_shots(league = "EPL")
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 2: AGGREGATE TO MATCH LEVEL WITH xG BY SITUATION
+# ═══════════════════════════════════════════════════════════════
+
+match_xg <- epl_shots %>%
+  filter(season >= 2016, season <= 2024) %>%
+  mutate(h_a = coalesce(h_a, home_away)) %>%
+  group_by(match_id, league, season, date, home_team, away_team, home_goals, away_goals) %>%
+  summarise(
+    home_xG          = sum(xG[h_a == "h"], na.rm = TRUE),
+    away_xG          = sum(xG[h_a == "a"], na.rm = TRUE),
+    home_xG_openplay = sum(xG[h_a == "h" & situation == "OpenPlay"], na.rm = TRUE),
+    away_xG_openplay = sum(xG[h_a == "a" & situation == "OpenPlay"], na.rm = TRUE),
+    home_xG_corner   = sum(xG[h_a == "h" & situation == "FromCorner"], na.rm = TRUE),
+    away_xG_corner   = sum(xG[h_a == "a" & situation == "FromCorner"], na.rm = TRUE),
+    home_xG_freekick = sum(xG[h_a == "h" & situation == "DirectFreekick"], na.rm = TRUE),
+    away_xG_freekick = sum(xG[h_a == "a" & situation == "DirectFreekick"], na.rm = TRUE),
+    home_xG_penalty  = sum(xG[h_a == "h" & situation == "Penalty"], na.rm = TRUE),
+    away_xG_penalty  = sum(xG[h_a == "a" & situation == "Penalty"], na.rm = TRUE),
+    home_xG_setpiece = sum(xG[h_a == "h" & situation == "SetPiece"], na.rm = TRUE),
+    away_xG_setpiece = sum(xG[h_a == "a" & situation == "SetPiece"], na.rm = TRUE),
+    home_xG_deadball = sum(xG[h_a == "h" & situation != "OpenPlay"], na.rm = TRUE),
+    away_xG_deadball = sum(xG[h_a == "a" & situation != "OpenPlay"], na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(date)
+
+saveRDS(match_xg, "epl_match_xg.rds")
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 3: RESHAPE TO TEAM LEVEL
+# ═══════════════════════════════════════════════════════════════
+
+model_df <- bind_rows(
+  match_xg %>% transmute(
+    match_id, season, date,
+    team        = home_team,
+    opponent    = away_team,
+    home_away   = "home",
+    goals       = home_goals,
+    xG_openplay = home_xG_openplay,
+    xG_corner   = home_xG_corner,
+    xG_freekick = home_xG_freekick,
+    xG_penalty  = home_xG_penalty,
+    xG_setpiece = home_xG_setpiece
+  ),
+  match_xg %>% transmute(
+    match_id, season, date,
+    team        = away_team,
+    opponent    = home_team,
+    home_away   = "away",
+    goals       = away_goals,
+    xG_openplay = away_xG_openplay,
+    xG_corner   = away_xG_corner,
+    xG_freekick = away_xG_freekick,
+    xG_penalty  = away_xG_penalty,
+    xG_setpiece = away_xG_setpiece
+  )
+) %>%
+  arrange(team, date)
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 4: EXPONENTIALLY WEIGHTED ROLLING AVERAGES
+# Recent games weighted more than older games
+# ═══════════════════════════════════════════════════════════════
+
+exp_weights <- exp(seq(0, 1, length.out = 5))
+exp_weights <- exp_weights / sum(exp_weights)
+cat("Exponential weights (oldest to most recent):\n")  # unchanged
+print(round(exp_weights, 3))                            # unchanged
+
+wmean5 <- function(x) weighted.mean(x, w = exp_weights)
+
+model_df <- model_df %>%
+  group_by(team) %>%
+  mutate(
+    roll_xG_openplay = lag(rollapply(xG_openplay, 5, FUN = wmean5, fill = NA, align = "right"), 1),
+    roll_xG_corner   = lag(rollapply(xG_corner,   5, FUN = wmean5, fill = NA, align = "right"), 1),
+    roll_xG_freekick = lag(rollapply(xG_freekick, 5, FUN = wmean5, fill = NA, align = "right"), 1),
+    roll_xG_penalty  = lag(rollapply(xG_penalty,  5, FUN = wmean5, fill = NA, align = "right"), 1),
+    roll_xG_setpiece = lag(rollapply(xG_setpiece, 5, FUN = wmean5, fill = NA, align = "right"), 1),
+    # NEW — total xG standard deviation over last 5 games
+    sd_xG = lag(rollapply(xG_openplay + xG_corner + xG_freekick +
+                          xG_penalty  + xG_setpiece,
+                          5, FUN = sd, fill = NA, align = "right"), 1)
+  ) %>%
+  ungroup()
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 5: BUILD FINAL MODELLING DATAFRAME
+# ═══════════════════════════════════════════════════════════════
+exp_weights <- exp(seq(0, 1, length.out = 5))
+exp_weights <- exp_weights / sum(exp_weights)
+wmean5 <- function(x) weighted.mean(x, w = exp_weights)
+
+team_match_df <- model_df %>%
+  left_join(
+    model_df %>%
+      select(
+        match_id,
+        opponent             = team,
+        opp_roll_xG_openplay = roll_xG_openplay,
+        opp_roll_xG_corner   = roll_xG_corner,
+        opp_roll_xG_freekick = roll_xG_freekick,
+        opp_roll_xG_penalty  = roll_xG_penalty,
+        opp_roll_xG_setpiece = roll_xG_setpiece,
+        opp_sd_xG            = sd_xG  
+      ),
+    by = c("match_id", "opponent")
+  ) %>%
+  mutate(home_flag = if_else(home_away == "home", 1, 0)) %>%
+  select(
+    match_id, season, date, team, opponent, home_away, home_flag, goals,
+    roll_xG_openplay, roll_xG_corner, roll_xG_freekick,
+    roll_xG_penalty,  roll_xG_setpiece, sd_xG,
+    opp_roll_xG_openplay, opp_roll_xG_corner, opp_roll_xG_freekick,
+    opp_roll_xG_penalty,  opp_roll_xG_setpiece, opp_sd_xG
+  ) %>%
+  drop_na() %>%
+  arrange(date)
+
+cat("Final modelling rows:", nrow(team_match_df), "\n")
+cat("Seasons:", paste(unique(team_match_df$season), collapse = ", "), "\n")
+
+saveRDS(team_match_df, "epl_team_match_df.rds")
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 6: MULTICOLLINEARITY CHECK
+# ═══════════════════════════════════════════════════════════════
+
+feature_cols <- team_match_df %>%
+  select(
+    roll_xG_openplay, roll_xG_corner, roll_xG_freekick,
+    roll_xG_penalty,  roll_xG_setpiece,
+    opp_roll_xG_openplay, opp_roll_xG_corner, opp_roll_xG_freekick,
+    opp_roll_xG_penalty,  opp_roll_xG_setpiece
+  )
+
+cor_matrix <- cor(feature_cols)
+corrplot(cor_matrix, method = "number", type = "upper",
+         tl.cex = 0.7, number.cex = 0.7,
+         title = "Feature Correlation Matrix")
+
+high_cor <- which(abs(cor_matrix) > 0.8 & cor_matrix != 1, arr.ind = TRUE)
+if (nrow(high_cor) > 0) {
+  cat("High correlations found:\n")
+  print(high_cor)
+} else {
+  cat("No high correlations — safe to proceed\n")
+}
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 7: TRAIN / TEST SPLIT
+# ═══════════════════════════════════════════════════════════════
+
+train_df <- team_match_df %>% filter(season <= 2022)
+test_df  <- team_match_df %>% filter(season >= 2023)
+
+cat("Train rows:", nrow(train_df), "| Seasons:", min(train_df$season), "-", max(train_df$season), "\n")
+cat("Test rows: ", nrow(test_df),  "| Seasons:", min(test_df$season),  "-", max(test_df$season),  "\n")
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 8: NEGATIVE BINOMIAL MODEL
+# ═══════════════════════════════════════════════════════════════
+
+nb_model <- glm.nb(
+  goals ~
+    roll_xG_openplay + roll_xG_corner + roll_xG_freekick +
+    roll_xG_penalty  + roll_xG_setpiece +  sd_xG +
+    opp_roll_xG_openplay + opp_roll_xG_corner + opp_roll_xG_freekick +
+    opp_roll_xG_penalty  + opp_roll_xG_setpiece + opp_sd_xG +
+    home_flag,
+  data = train_df
+)
+
+summary(nb_model)
+
+# Dispersion parameter — how much extra variance vs Poisson
+cat("\nDispersion parameter (theta):", nb_model$theta, "\n")
+cat("If theta is large → close to Poisson\n")
+cat("If theta is small → much more overdispersion than Poisson\n")
+
+test_df <- test_df %>%
+  mutate(pred_nb = predict(nb_model, newdata = test_df, type = "response"))
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 9: XGBOOST
+# ═══════════════════════════════════════════════════════════════
+
+feature_names <- c(
+  "roll_xG_openplay", "roll_xG_corner", "roll_xG_freekick",
+  "roll_xG_penalty",  "roll_xG_setpiece", "sd_xG",
+  "opp_roll_xG_openplay", "opp_roll_xG_corner", "opp_roll_xG_freekick",
+  "opp_roll_xG_penalty",  "opp_roll_xG_setpiece", "opp_sd_xG",
+  "home_flag"
+)
+
+train_matrix <- xgb.DMatrix(
+  data  = as.matrix(train_df[, feature_names]),
+  label = train_df$goals
+)
+
+test_matrix <- xgb.DMatrix(
+  data  = as.matrix(test_df[, feature_names]),
+  label = test_df$goals
+)
+
+xgb_model <- xgb.train(
+  params = list(
+    objective        = "count:poisson",
+    eta              = 0.05,
+    max_depth        = 4,
+    subsample        = 0.8,
+    colsample_bytree = 0.8
+  ),
+  data                  = train_matrix,
+  nrounds               = 500,
+  evals                 = list(train = train_matrix, test = test_matrix),
+  early_stopping_rounds = 30,
+  verbose               = 1,
+  print_every_n         = 50
+)
+
+test_df <- test_df %>%
+  mutate(pred_xgb = predict(xgb_model, test_matrix))
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 10: EVALUATE ALL MODELS
+# ═══════════════════════════════════════════════════════════════
+
+results <- test_df %>%
+  summarise(
+    rmse_nb  = sqrt(mean((goals - pred_nb)^2)),
+    rmse_xgb = sqrt(mean((goals - pred_xgb)^2)),
+    mae_nb   = mean(abs(goals - pred_nb)),
+    mae_xgb  = mean(abs(goals - pred_xgb)),
+    bias_nb  = mean(pred_nb  - goals),
+    bias_xgb = mean(pred_xgb - goals)
+  )
+
+cat("\n=== Model Evaluation ===\n")
+print(results)
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 11: FEATURE IMPORTANCE
+# ═══════════════════════════════════════════════════════════════
+
+importance <- xgb.importance(feature_names = feature_names, model = xgb_model)
+xgb.plot.importance(importance, top_n = 11)
+print(importance)
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 12: DISTRIBUTION CHECK
+# ═══════════════════════════════════════════════════════════════
+
+test_df %>%
+  count(goals) %>%
+  mutate(pct_actual = round(n / sum(n), 3)) %>%
+  left_join(
+    test_df %>%
+      mutate(pred_rounded_nb = round(pred_nb)) %>%
+      count(pred_rounded_nb) %>%
+      mutate(pct_nb = round(n / sum(n), 3)) %>%
+      rename(goals = pred_rounded_nb),
+    by = "goals"
+  ) %>%
+  left_join(
+    test_df %>%
+      mutate(pred_rounded_xgb = round(pred_xgb)) %>%
+      count(pred_rounded_xgb) %>%
+      mutate(pct_xgb = round(n / sum(n), 3)) %>%
+      rename(goals = pred_rounded_xgb),
+    by = "goals"
+  ) %>%
+  print()
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 13: VISUALISE
+# ═══════════════════════════════════════════════════════════════
+
+test_df %>%
+  select(goals, pred_nb, pred_xgb) %>%
+  pivot_longer(-goals, names_to = "model", values_to = "predicted") %>%
+  ggplot(aes(x = goals, y = predicted, color = model)) +
+  geom_jitter(alpha = 0.3, width = 0.1) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  facet_wrap(~model) +
+  labs(
+    title = "Predicted vs Actual Goals (Per Team Per Match)",
+    x     = "Actual Goals",
+    y     = "Predicted Goals"
+  ) +
+  theme_minimal()
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 14: SAVE
+# ═══════════════════════════════════════════════════════════════
+
+saveRDS(nb_model,  "nb_model.rds")
+saveRDS(test_df,   "test_predictions.rds")
+xgb.save(xgb_model, "xgb_model.ubj")
+
+cat("\n=== All models saved ===\n")
+```
+
+
+
+
+
+UNDER HERE THE STANDARD DEVIATION HAS BEEN ADDED BEFORE THE MODEL IN ORDER TO SHRINK ESTIMATES OF INCOSISTENT TEAM. ALSO A SIMPLE NEGATIVE BINOMIAL MODEL HAS BEEN MADE BY REMOVING NON SIGNIFICANT VARIABLES. aLSO THE XGBOOST IS KEPT WITH THE STANDARD DEVIATION FROM BEFORE, AS IT SEEMS TO BE IMPORTANT FOR THE XGBOOST BUT NOT THE NEGATIVE BINOMIAL MODEL.
+
+
+```{r}
+# ═══════════════════════════════════════════════════════════════
+# STEP 4: EXPONENTIALLY WEIGHTED ROLLING AVERAGES + SD ADJUSTMENT
+# ═══════════════════════════════════════════════════════════════
+
+exp_weights <- exp(seq(0, 1, length.out = 5))
+exp_weights <- exp_weights / sum(exp_weights)
+cat("Exponential weights (oldest to most recent):\n")
+print(round(exp_weights, 3))
+
+wmean5 <- function(x) weighted.mean(x, w = exp_weights)
+
+model_df <- model_df %>%
+  group_by(team) %>%
+  mutate(
+    # Weighted rolling means
+    roll_xG_openplay = lag(rollapply(xG_openplay, 5, FUN = wmean5, fill = NA, align = "right"), 1),
+    roll_xG_corner   = lag(rollapply(xG_corner,   5, FUN = wmean5, fill = NA, align = "right"), 1),
+    roll_xG_freekick = lag(rollapply(xG_freekick, 5, FUN = wmean5, fill = NA, align = "right"), 1),
+    roll_xG_penalty  = lag(rollapply(xG_penalty,  5, FUN = wmean5, fill = NA, align = "right"), 1),
+    roll_xG_setpiece = lag(rollapply(xG_setpiece, 5, FUN = wmean5, fill = NA, align = "right"), 1),
+
+    # Total xG sd over last 5 games
+    sd_xG = lag(rollapply(xG_openplay + xG_corner + xG_freekick +
+                          xG_penalty  + xG_setpiece,
+                          5, FUN = sd, fill = NA, align = "right"), 1),
+
+    # ── SD adjustment BEFORE model ─────────────────────────────
+    # Shrinks estimates for inconsistent teams
+    # High sd → less reliable mean → shrink toward zero
+    # Low sd  → reliable mean → keep close to original
+    roll_xG_openplay_adj = roll_xG_openplay / (1 + sd_xG),
+    roll_xG_corner_adj   = roll_xG_corner   / (1 + sd_xG),
+    roll_xG_freekick_adj = roll_xG_freekick / (1 + sd_xG),
+    roll_xG_penalty_adj  = roll_xG_penalty  / (1 + sd_xG),
+    roll_xG_setpiece_adj = roll_xG_setpiece / (1 + sd_xG)
+  ) %>%
+  ungroup()
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 5: BUILD FINAL MODELLING DATAFRAME
+# ═══════════════════════════════════════════════════════════════
+
+team_match_df <- model_df %>%
+  left_join(
+    model_df %>%
+      dplyr::select(
+        match_id,
+        opponent                 = team,
+        opp_roll_xG_openplay_adj = roll_xG_openplay_adj,
+        opp_roll_xG_corner_adj   = roll_xG_corner_adj,
+        opp_roll_xG_freekick_adj = roll_xG_freekick_adj,
+        opp_roll_xG_penalty_adj  = roll_xG_penalty_adj,
+        opp_roll_xG_setpiece_adj = roll_xG_setpiece_adj,
+        opp_sd_xG                = sd_xG
+      ),
+    by = c("match_id", "opponent")
+  ) %>%
+  mutate(home_flag = if_else(home_away == "home", 1, 0)) %>%
+  dplyr::select(
+    match_id, season, date, team, opponent, home_away, home_flag, goals,
+    roll_xG_openplay_adj, roll_xG_corner_adj, roll_xG_freekick_adj,
+    roll_xG_penalty_adj,  roll_xG_setpiece_adj,
+    sd_xG,
+    opp_roll_xG_openplay_adj, opp_roll_xG_corner_adj, opp_roll_xG_freekick_adj,
+    opp_roll_xG_penalty_adj,  opp_roll_xG_setpiece_adj,
+    opp_sd_xG,
+    home_flag
+  ) %>%
+  drop_na() %>%
+  arrange(date)
+
+cat("Final modelling rows:", nrow(team_match_df), "\n")
+cat("Seasons:", paste(unique(team_match_df$season), collapse = ", "), "\n")
+saveRDS(team_match_df, "epl_team_match_df.rds")
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 6: MULTICOLLINEARITY CHECK
+# ═══════════════════════════════════════════════════════════════
+
+feature_cols <- team_match_df %>%
+  dplyr::select(
+    roll_xG_openplay_adj, roll_xG_corner_adj, roll_xG_freekick_adj,
+    roll_xG_penalty_adj,  roll_xG_setpiece_adj, sd_xG,
+    opp_roll_xG_openplay_adj, opp_roll_xG_corner_adj, opp_roll_xG_freekick_adj,
+    opp_roll_xG_penalty_adj,  opp_roll_xG_setpiece_adj, opp_sd_xG
+  )
+
+cor_matrix <- cor(feature_cols)
+corrplot(cor_matrix, method = "number", type = "upper",
+         tl.cex = 0.7, number.cex = 0.7,
+         title = "Feature Correlation Matrix")
+
+high_cor <- which(abs(cor_matrix) > 0.8 & cor_matrix != 1, arr.ind = TRUE)
+if (nrow(high_cor) > 0) {
+  cat("High correlations found:\n")
+  print(high_cor)
+} else {
+  cat("No high correlations — safe to proceed\n")
+}
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 7: TRAIN / TEST SPLIT
+# ═══════════════════════════════════════════════════════════════
+
+train_df <- team_match_df %>% filter(season <= 2022)
+test_df  <- team_match_df %>% filter(season >= 2023)
+
+cat("Train rows:", nrow(train_df), "| Seasons:", min(train_df$season), "-", max(train_df$season), "\n")
+cat("Test rows: ", nrow(test_df),  "| Seasons:", min(test_df$season),  "-", max(test_df$season),  "\n")
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 8: SIMPLE NB MODEL — 3 variables only
+# ═══════════════════════════════════════════════════════════════
+
+nb_simple <- glm.nb(
+  goals ~
+    roll_xG_openplay_adj +
+    opp_roll_xG_openplay_adj +
+    home_flag,
+  data = train_df
+)
+
+summary(nb_simple)
+cat("\nTheta:", nb_simple$theta, "\n")
+
+test_df <- test_df %>%
+  mutate(pred_nb_simple = predict(nb_simple, newdata = test_df, type = "response"))
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 9: FULL NB MODEL — all adjusted variables
+# ═══════════════════════════════════════════════════════════════
+
+nb_full <- glm.nb(
+  goals ~
+    roll_xG_openplay_adj + roll_xG_corner_adj + roll_xG_freekick_adj +
+    roll_xG_penalty_adj  + roll_xG_setpiece_adj +
+    sd_xG +
+    opp_roll_xG_openplay_adj + opp_roll_xG_corner_adj + opp_roll_xG_freekick_adj +
+    opp_roll_xG_penalty_adj  + opp_roll_xG_setpiece_adj +
+    opp_sd_xG +
+    home_flag,
+  data = train_df
+)
+
+summary(nb_full)
+cat("\nTheta:", nb_full$theta, "\n")
+
+# AIC comparison
+cat("\n=== AIC Comparison ===\n")
+cat("Simple NB AIC:", AIC(nb_simple), "\n")
+cat("Full NB AIC:  ", AIC(nb_full),   "\n")
+cat("Lower is better — difference of <2 means models are equivalent\n")
+
+test_df <- test_df %>%
+  mutate(pred_nb_full = predict(nb_full, newdata = test_df, type = "response"))
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 10: XGBOOST — full feature set
+# ═══════════════════════════════════════════════════════════════
+
+feature_names <- c(
+  "roll_xG_openplay_adj", "roll_xG_corner_adj", "roll_xG_freekick_adj",
+  "roll_xG_penalty_adj",  "roll_xG_setpiece_adj",
+  "sd_xG",
+  "opp_roll_xG_openplay_adj", "opp_roll_xG_corner_adj", "opp_roll_xG_freekick_adj",
+  "opp_roll_xG_penalty_adj",  "opp_roll_xG_setpiece_adj",
+  "opp_sd_xG",
+  "home_flag"
+)
+
+train_matrix <- xgb.DMatrix(
+  data  = as.matrix(train_df[, feature_names]),
+  label = train_df$goals
+)
+
+test_matrix <- xgb.DMatrix(
+  data  = as.matrix(test_df[, feature_names]),
+  label = test_df$goals
+)
+
+xgb_model <- xgb.train(
+  params = list(
+    objective        = "count:poisson",
+    eta              = 0.05,
+    max_depth        = 4,
+    subsample        = 0.8,
+    colsample_bytree = 0.8
+  ),
+  data                  = train_matrix,
+  nrounds               = 500,
+  evals                 = list(train = train_matrix, test = test_matrix),
+  early_stopping_rounds = 30,
+  verbose               = 1,
+  print_every_n         = 50
+)
+
+test_df <- test_df %>%
+  mutate(pred_xgb = predict(xgb_model, test_matrix))
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 11: EVALUATE ALL THREE MODELS
+# ═══════════════════════════════════════════════════════════════
+
+results <- test_df %>%
+  summarise(
+    rmse_nb_simple = sqrt(mean((goals - pred_nb_simple)^2)),
+    rmse_nb_full   = sqrt(mean((goals - pred_nb_full)^2)),
+    rmse_xgb       = sqrt(mean((goals - pred_xgb)^2)),
+    mae_nb_simple  = mean(abs(goals - pred_nb_simple)),
+    mae_nb_full    = mean(abs(goals - pred_nb_full)),
+    mae_xgb        = mean(abs(goals - pred_xgb)),
+    bias_nb_simple = mean(pred_nb_simple - goals),
+    bias_nb_full   = mean(pred_nb_full   - goals),
+    bias_xgb       = mean(pred_xgb       - goals)
+  )
+
+cat("\n=== Model Evaluation ===\n")
+print(results)
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 12: FEATURE IMPORTANCE
+# ═══════════════════════════════════════════════════════════════
+
+importance <- xgb.importance(feature_names = feature_names, model = xgb_model)
+xgb.plot.importance(importance, top_n = 13)
+print(importance)
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 13: DISTRIBUTION CHECK — ALL THREE MODELS
+# ═══════════════════════════════════════════════════════════════
+
+test_df %>%
+  count(goals) %>%
+  mutate(pct_actual = round(n / sum(n), 3)) %>%
+  left_join(
+    test_df %>%
+      mutate(pred_rounded = round(pred_nb_simple)) %>%
+      count(pred_rounded) %>%
+      mutate(pct_nb_simple = round(n / sum(n), 3)) %>%
+      rename(goals = pred_rounded),
+    by = "goals"
+  ) %>%
+  left_join(
+    test_df %>%
+      mutate(pred_rounded = round(pred_nb_full)) %>%
+      count(pred_rounded) %>%
+      mutate(pct_nb_full = round(n / sum(n), 3)) %>%
+      rename(goals = pred_rounded),
+    by = "goals"
+  ) %>%
+  left_join(
+    test_df %>%
+      mutate(pred_rounded = round(pred_xgb)) %>%
+      count(pred_rounded) %>%
+      mutate(pct_xgb = round(n / sum(n), 3)) %>%
+      rename(goals = pred_rounded),
+    by = "goals"
+  ) %>%
+  print()
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 14: VISUALISE
+# ═══════════════════════════════════════════════════════════════
+
+test_df %>%
+  dplyr::select(goals, pred_nb_simple, pred_nb_full, pred_xgb) %>%
+  pivot_longer(-goals, names_to = "model", values_to = "predicted") %>%
+  ggplot(aes(x = goals, y = predicted, color = model)) +
+  geom_jitter(alpha = 0.3, width = 0.1) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  facet_wrap(~model) +
+  labs(
+    title = "Predicted vs Actual Goals (Per Team Per Match)",
+    x     = "Actual Goals",
+    y     = "Predicted Goals"
+  ) +
+  theme_minimal()
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 15: SAVE
+# ═══════════════════════════════════════════════════════════════
+
+saveRDS(nb_simple, "nb_simple_model.rds")
+saveRDS(nb_full,   "nb_full_model.rds")
+saveRDS(test_df,   "test_predictions.rds")
+xgb.save(xgb_model, "xgb_model.ubj")
+
+cat("\n=== All models saved ===\n")
+```
+
+
+FInal MODEL KINDA:
+
+SO VARAIBLES LEFT ARE both Openplay, Standard deviation, Corners both, and home advantage.
+They have been made to into 3 diffrent model with Negative binomial. Also the XGBOOST have same varaibles for comparison, as more data would screw the comparison
+
+
+
+
+```{r}
+# ═══════════════════════════════════════════════════════════════
+# STEP 1: LOAD & AGGREGATE 
+# ═══════════════════════════════════════════════════════════════
+
+epl_shots <- load_understat_league_shots(league = "EPL")
+
+match_xg <- epl_shots %>%
+  filter(season >= 2016, season <= 2024) %>%
+  mutate(h_a = coalesce(h_a, home_away)) %>%
+  group_by(match_id, league, season, date, home_team, away_team, home_goals, away_goals) %>%
+  summarise(
+    home_xG_openplay = sum(xG[h_a == "h" & situation == "OpenPlay"],      na.rm = TRUE),
+    away_xG_openplay = sum(xG[h_a == "a" & situation == "OpenPlay"],      na.rm = TRUE),
+    home_xG_corner   = sum(xG[h_a == "h" & situation == "FromCorner"],    na.rm = TRUE),
+    away_xG_corner   = sum(xG[h_a == "a" & situation == "FromCorner"],    na.rm = TRUE),
+    home_xG_freekick = sum(xG[h_a == "h" & situation == "DirectFreekick"],na.rm = TRUE),
+    away_xG_freekick = sum(xG[h_a == "a" & situation == "DirectFreekick"],na.rm = TRUE),
+    home_xG_penalty  = sum(xG[h_a == "h" & situation == "Penalty"],       na.rm = TRUE),
+    away_xG_penalty  = sum(xG[h_a == "a" & situation == "Penalty"],       na.rm = TRUE),
+    home_xG_setpiece = sum(xG[h_a == "h" & situation == "SetPiece"],      na.rm = TRUE),
+    away_xG_setpiece = sum(xG[h_a == "a" & situation == "SetPiece"],      na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(date)
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 2: RESHAPE TO TEAM LEVEL
+# ═══════════════════════════════════════════════════════════════
+
+model_df <- bind_rows(
+  match_xg %>% transmute(
+    match_id, season, date,
+    team        = home_team,
+    opponent    = away_team,
+    home_away   = "home",
+    goals       = home_goals,
+    xG_openplay = home_xG_openplay,
+    xG_corner   = home_xG_corner,
+    xG_freekick = home_xG_freekick,
+    xG_penalty  = home_xG_penalty,
+    xG_setpiece = home_xG_setpiece
+  ),
+  match_xg %>% transmute(
+    match_id, season, date,
+    team        = away_team,
+    opponent    = home_team,
+    home_away   = "away",
+    goals       = away_goals,
+    xG_openplay = away_xG_openplay,
+    xG_corner   = away_xG_corner,
+    xG_freekick = away_xG_freekick,
+    xG_penalty  = away_xG_penalty,
+    xG_setpiece = away_xG_setpiece
+  )
+) %>%
+  arrange(team, date)
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 3: EXPONENTIALLY WEIGHTED ROLLING MEANS + SD
+# No pre-adjustment — SD enters model as its own feature
+# ═══════════════════════════════════════════════════════════════
+
+exp_weights <- exp(seq(0, 1, length.out = 5))
+exp_weights <- exp_weights / sum(exp_weights)
+wmean5      <- function(x) weighted.mean(x, w = exp_weights)
+
+model_df <- model_df %>%
+  group_by(team) %>%
+  mutate(
+    roll_xG_openplay = lag(rollapply(xG_openplay, 5, FUN = wmean5, fill = NA, align = "right"), 1),
+    roll_xG_corner   = lag(rollapply(xG_corner,   5, FUN = wmean5, fill = NA, align = "right"), 1),
+    roll_xG_freekick = lag(rollapply(xG_freekick, 5, FUN = wmean5, fill = NA, align = "right"), 1),
+    roll_xG_penalty  = lag(rollapply(xG_penalty,  5, FUN = wmean5, fill = NA, align = "right"), 1),
+    roll_xG_setpiece = lag(rollapply(xG_setpiece, 5, FUN = wmean5, fill = NA, align = "right"), 1),
+    # SD of total xG over last 5 games — raw, no adjustment
+    sd_xG = lag(rollapply(
+      xG_openplay + xG_corner + xG_freekick + xG_penalty + xG_setpiece,
+      5, FUN = sd, fill = NA, align = "right"), 1)
+  ) %>%
+  ungroup()
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 4: BUILD MODELLING DATAFRAME
+# ═══════════════════════════════════════════════════════════════
+
+team_match_df <- model_df %>%
+  left_join(
+    model_df %>%
+      dplyr::select(
+        match_id,
+        opponent             = team,
+        opp_roll_xG_openplay = roll_xG_openplay,
+        opp_roll_xG_corner   = roll_xG_corner,
+        opp_roll_xG_freekick = roll_xG_freekick,
+        opp_roll_xG_penalty  = roll_xG_penalty,
+        opp_roll_xG_setpiece = roll_xG_setpiece,
+        opp_sd_xG            = sd_xG
+      ),
+    by = c("match_id", "opponent")
+  ) %>%
+  mutate(home_flag = if_else(home_away == "home", 1, 0)) %>%
+  dplyr::select(
+    match_id, season, date, team, opponent, home_away, home_flag, goals,
+    roll_xG_openplay, roll_xG_corner, roll_xG_freekick,
+    roll_xG_penalty,  roll_xG_setpiece, sd_xG,
+    opp_roll_xG_openplay, opp_roll_xG_corner, opp_roll_xG_freekick,
+    opp_roll_xG_penalty,  opp_roll_xG_setpiece, opp_sd_xG
+  ) %>%
+  drop_na() %>%
+  arrange(date)
+
+cat("Final modelling rows:", nrow(team_match_df), "\n")
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 5: TRAIN / TEST SPLIT
+# ═══════════════════════════════════════════════════════════════
+
+train_df <- team_match_df %>% filter(season <= 2022)
+test_df  <- team_match_df %>% filter(season >= 2023)
+
+cat("Train rows:", nrow(train_df), "| Seasons:", min(train_df$season), "-", max(train_df$season), "\n")
+cat("Test rows: ", nrow(test_df),  "| Seasons:", min(test_df$season),  "-", max(test_df$season),  "\n")
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 6: MODEL 1 — Simple NB (openplay + SD + home)
+# Poisson vs NB: theta will tell us if NB is needed
+# If theta is very large (>20), Poisson would be nearly identical
+# ═══════════════════════════════════════════════════════════════
+
+nb_simple <- glm.nb(
+  goals ~
+    roll_xG_openplay +
+    opp_roll_xG_openplay +
+    sd_xG +
+    opp_sd_xG +
+    home_flag,
+  data = train_df
+)
+
+summary(nb_simple)
+cat("\nTheta:", nb_simple$theta,
+    "— if >20, Poisson would give near-identical results\n")
+
+test_df <- test_df %>%
+  mutate(pred_nb_simple = predict(nb_simple, newdata = test_df, type = "response"))
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 7: MODEL 2 — NB with freekick added
+# Freekick xG is rare but high-value — worth testing separately
+# ═══════════════════════════════════════════════════════════════
+
+nb_freekick <- glm.nb(
+  goals ~
+    roll_xG_openplay +
+    roll_xG_freekick +
+    opp_roll_xG_openplay +
+    opp_roll_xG_freekick +
+    sd_xG +
+    opp_sd_xG +
+    home_flag,
+  data = train_df
+)
+
+summary(nb_freekick)
+cat("\nTheta:", nb_freekick$theta, "\n")
+
+cat("\n=== AIC Comparison: Simple vs Freekick ===\n")
+cat("Simple NB AIC:  ", AIC(nb_simple),   "\n")
+cat("Freekick NB AIC:", AIC(nb_freekick), "\n")
+cat("Lower is better — difference <2 means models are equivalent\n")
+
+test_df <- test_df %>%
+  mutate(pred_nb_freekick = predict(nb_freekick, newdata = test_df, type = "response"))
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 8: XGBOOST
+# Using same features as nb_freekick model for fair comparison
+# XGBoost can find non-linear interactions the NB cannot,
+# so keeping feature sets aligned lets you isolate model gains
+# ═══════════════════════════════════════════════════════════════
+
+feature_names <- c(
+  "roll_xG_openplay", "roll_xG_freekick",
+  "sd_xG",
+  "opp_roll_xG_openplay", "opp_roll_xG_freekick",
+  "opp_sd_xG",
+  "home_flag"
+)
+
+train_matrix <- xgb.DMatrix(
+  data  = as.matrix(train_df[, feature_names]),
+  label = train_df$goals
+)
+
+test_matrix <- xgb.DMatrix(
+  data  = as.matrix(test_df[, feature_names]),
+  label = test_df$goals
+)
+
+xgb_model <- xgb.train(
+  params = list(
+    objective        = "count:poisson",
+    eta              = 0.05,
+    max_depth        = 4,
+    subsample        = 0.8,
+    colsample_bytree = 0.8
+  ),
+  data                  = train_matrix,
+  nrounds               = 500,
+  evals                 = list(train = train_matrix, test = test_matrix),
+  early_stopping_rounds = 30,
+  verbose               = 1,
+  print_every_n         = 50
+)
+
+test_df <- test_df %>%
+  mutate(pred_xgb = predict(xgb_model, test_matrix))
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 9: EVALUATE ALL THREE MODELS
+# ═══════════════════════════════════════════════════════════════
+
+results <- test_df %>%
+  summarise(
+    rmse_nb_simple   = sqrt(mean((goals - pred_nb_simple)^2)),
+    rmse_nb_freekick = sqrt(mean((goals - pred_nb_freekick)^2)),
+    rmse_xgb         = sqrt(mean((goals - pred_xgb)^2)),
+    mae_nb_simple    = mean(abs(goals - pred_nb_simple)),
+    mae_nb_freekick  = mean(abs(goals - pred_nb_freekick)),
+    mae_xgb          = mean(abs(goals - pred_xgb)),
+    bias_nb_simple   = mean(pred_nb_simple   - goals),
+    bias_nb_freekick = mean(pred_nb_freekick - goals),
+    bias_xgb         = mean(pred_xgb         - goals)
+  )
+
+cat("\n=== Model Evaluation ===\n")
+print(results)
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 10: FEATURE IMPORTANCE
+# ═══════════════════════════════════════════════════════════════
+
+importance <- xgb.importance(feature_names = feature_names, model = xgb_model)
+xgb.plot.importance(importance)
+print(importance)
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 11: DISTRIBUTION CHECK
+# ═══════════════════════════════════════════════════════════════
+
+test_df %>%
+  count(goals) %>%
+  mutate(pct_actual = round(n / sum(n), 3)) %>%
+  left_join(
+    test_df %>% mutate(g = round(pred_nb_simple))   %>% count(g) %>% mutate(pct_nb_simple   = round(n/sum(n),3)) %>% rename(goals=g),
+    by = "goals") %>%
+  left_join(
+    test_df %>% mutate(g = round(pred_nb_freekick)) %>% count(g) %>% mutate(pct_nb_freekick = round(n/sum(n),3)) %>% rename(goals=g),
+    by = "goals") %>%
+  left_join(
+    test_df %>% mutate(g = round(pred_xgb))         %>% count(g) %>% mutate(pct_xgb         = round(n/sum(n),3)) %>% rename(goals=g),
+    by = "goals") %>%
+  print()
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 12: VISUALISE
+# ═══════════════════════════════════════════════════════════════
+
+test_df %>%
+  dplyr::select(goals, pred_nb_simple, pred_nb_freekick, pred_xgb) %>%
+  pivot_longer(-goals, names_to = "model", values_to = "predicted") %>%
+  ggplot(aes(x = goals, y = predicted, color = model)) +
+  geom_jitter(alpha = 0.3, width = 0.1) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  facet_wrap(~model) +
+  labs(title = "Predicted vs Actual Goals (Per Team Per Match)",
+       x = "Actual Goals", y = "Predicted Goals") +
+  theme_minimal()
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 13: SAVE
+# ═══════════════════════════════════════════════════════════════
+
+saveRDS(nb_simple,   "nb_simple_model.rds")
+saveRDS(nb_freekick, "nb_freekick_model.rds")
+saveRDS(test_df,     "test_predictions.rds")
+xgb.save(xgb_model,  "xgb_model.ubj")
+
+cat("\n=== All models saved ===\n")
+```
+
+NB model is kept instead of poisson, and there is still slight overdispertion.
