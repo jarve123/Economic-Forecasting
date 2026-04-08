@@ -1,0 +1,388 @@
+---
+title: "merged with xg"
+author: "Jonathan Arve Thomsen"
+date: "2026-03-30"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Load packages and dataset
+```{r}
+library(dplyr)
+library(stringr)
+library(lubridate)
+library(readr)
+
+pl <- readRDS("pl_clean.rds")
+match_xg <- readRDS("epl_match_xg.rds")
+```
+
+Map team names
+```{r}
+team_map <- c(
+  "Man City" = "Manchester City",
+  "Man United" = "Manchester United",
+  "Newcastle" = "Newcastle United",
+  "Nott'm Forest" = "Nottingham Forest",
+  "West Brom" = "West Bromwich Albion",
+  "Wolves" = "Wolverhampton Wanderers"
+)
+
+pl <- pl %>%
+  mutate(
+    HomeTeam = recode(HomeTeam, !!!team_map),
+    AwayTeam = recode(AwayTeam, !!!team_map)
+  )
+
+sort(unique(pl$HomeTeam))
+sort(unique(match_xg$home_team))
+```
+Make Understat date a real date
+```{r}
+match_xg <- match_xg %>%
+  mutate(date = as.Date(date))
+
+summary(match_xg$date)
+head(match_xg$date)
+```
+
+Include most important xg variables
+```{r}
+match_xg_small <- match_xg %>%
+  select(
+    date, season, home_team, away_team,
+    home_goals, away_goals,
+    home_xG, away_xG
+  )
+```
+
+Merge datasets
+```{r}
+pl_xg <- pl %>%
+  left_join(
+    match_xg_small,
+    by = c(
+      "Date" = "date",
+      "HomeTeam" = "home_team",
+      "AwayTeam" = "away_team"
+    )
+  )
+```
+
+Check merge quality
+```{r}
+sum(is.na(pl_xg$home_xG))
+sum(is.na(pl_xg$away_xG))
+
+mean(is.na(pl_xg$home_xG))
+mean(is.na(pl_xg$away_xG))
+```
+Xg feature
+```{r}
+pl_xg <- pl_xg %>%
+  mutate(
+    xG_diff = home_xG - away_xG
+  )
+```
+
+Split data
+```{r}
+train_xg <- pl_xg %>%
+  filter(Date < as.Date("2023-08-01"))
+
+test_xg <- pl_xg %>%
+  filter(Date >= as.Date("2023-08-01"))
+```
+
+Estimate model
+```{r}
+model_xg <- glm(
+  home_win ~ p_home + xG_diff,
+  data = train_xg %>% filter(!is.na(xG_diff)),
+  family = binomial
+)
+```
+
+Predictions
+```{r}
+test_xg_eval <- test_xg %>%
+  filter(!is.na(xG_diff)) %>%
+  mutate(
+    pred_xg = predict(model_xg, newdata = ., type = "response")
+  )
+```
+
+Evaluate
+```{r}
+log_loss(test_xg_eval$home_win, test_xg_eval$pred_xg)
+brier_score(test_xg_eval$home_win, test_xg_eval$pred_xg)
+```
+
+Rolling setup
+```{r}
+library(zoo)
+
+pl_xg <- pl_xg %>%
+  group_by(HomeTeam) %>%
+  arrange(Date, .by_group = TRUE) %>%
+  mutate(
+    home_xG_avg = lag(rollapply(home_xG, 5, mean, fill = NA, align = "right"))
+  ) %>%
+  ungroup()
+```
+
+Train og test data
+```{r}
+train_xg <- pl_xg %>%
+  filter(Date < as.Date("2023-08-01"))
+
+test_xg <- pl_xg %>%
+  filter(Date >= as.Date("2023-08-01"))
+```
+New model
+```{r}
+model_xg_real <- glm(
+  home_win ~ p_home + home_xG_avg,
+  data = train_xg %>% filter(!is.na(home_xG_avg)),
+  family = binomial
+)
+```
+
+Predictions
+```{r}
+test_xg_eval2 <- test_xg %>%
+  filter(!is.na(home_xG_avg)) %>%
+  mutate(
+    pred_xg2 = predict(model_xg_real, newdata = ., type = "response")
+  )
+```
+
+Evaluering
+```{r}
+log_loss(test_xg_eval2$home_win, test_xg_eval2$pred_xg2)
+brier_score(test_xg_eval2$home_win, test_xg_eval2$pred_xg2)
+```
+
+Variance and summary statistics
+```{r}
+var(test$p_home)
+var(test_xg_eval2$pred_xg2)
+
+summary(test$p_home)
+summary(test_xg_eval2$pred_xg2)
+```
+
+POTENTIEL UDVIDELSE
+Including team strength
+```{r}
+pl_xg <- pl_xg %>%
+  group_by(AwayTeam) %>%
+  arrange(Date, .by_group = TRUE) %>%
+  mutate(
+    away_xG_avg = lag(rollapply(away_xG, 5, mean, fill = NA, align = "right"))
+  ) %>%
+  ungroup()
+
+pl_xg <- pl_xg %>%
+  mutate(
+    xG_diff_avg = home_xG_avg - away_xG_avg
+  )
+```
+
+Train and test setup again
+```{r}
+train_xg <- pl_xg %>%
+  filter(Date < as.Date("2023-08-01"))
+
+test_xg <- pl_xg %>%
+  filter(Date >= as.Date("2023-08-01"))
+```
+
+
+Model setup
+```{r}
+model_xg_diff <- glm(
+  home_win ~ p_home + xG_diff_avg,
+  data = train_xg %>% filter(!is.na(xG_diff_avg)),
+  family = binomial
+)
+```
+
+Predictions
+```{r}
+test_xg_diff_eval <- test_xg %>%
+  filter(!is.na(xG_diff_avg)) %>%
+  mutate(
+    pred_xg_diff = predict(model_xg_diff, newdata = ., type = "response")
+  )
+```
+
+Evaluate model
+```{r}
+log_loss(test_xg_diff_eval$home_win, test_xg_diff_eval$pred_xg_diff)
+brier_score(test_xg_diff_eval$home_win, test_xg_diff_eval$pred_xg_diff)
+```
+
+Overview of all models
+```{r}
+results_table <- tibble(
+  model = c("Bookmaker", "Logit odds", "Logit + home goals avg", "Logit + xG diff avg"),
+  log_loss = c(
+    log_loss(test$home_win, test$p_home),
+    log_loss(test$home_win, test$pred_logit),
+    log_loss(test_eval$home_win, test_eval$pred_extended),
+    log_loss(test_xg_diff_eval$home_win, test_xg_diff_eval$pred_xg_diff)
+  ),
+  brier = c(
+    brier_score(test$home_win, test$p_home),
+    brier_score(test$home_win, test$pred_logit),
+    brier_score(test_eval$home_win, test_eval$pred_extended),
+    brier_score(test_xg_diff_eval$home_win, test_xg_diff_eval$pred_xg_diff)
+  )
+)
+
+results_table
+```
+Calibration table for xg-model
+```{r}
+calibration_xg <- test_xg_diff_eval %>%
+  mutate(
+    prob_bucket = cut(
+      pred_xg_diff,
+      breaks = seq(0, 1, by = 0.1),
+      include.lowest = TRUE
+    )
+  ) %>%
+  group_by(prob_bucket) %>%
+  summarise(
+    n = n(),
+    avg_pred = mean(pred_xg_diff, na.rm = TRUE),
+    actual_home_win = mean(home_win, na.rm = TRUE)
+  )
+
+calibration_xg
+```
+Calibration table for bookmaker
+```{r}
+calibration_book <- test %>%
+  mutate(
+    prob_bucket = cut(
+      p_home,
+      breaks = seq(0, 1, by = 0.1),
+      include.lowest = TRUE
+    )
+  ) %>%
+  group_by(prob_bucket) %>%
+  summarise(
+    n = n(),
+    avg_pred = mean(p_home, na.rm = TRUE),
+    actual_home_win = mean(home_win, na.rm = TRUE)
+  )
+
+calibration_book
+```
+Compare heterogeneity
+```{r}
+var(test$p_home)
+var(test_xg_diff_eval$pred_xg_diff)
+
+summary(test$p_home)
+summary(test_xg_diff_eval$pred_xg_diff)
+```
+Robustness check with other rolling windows
+3 games:
+```{r}
+pl_xg <- pl_xg %>%
+  group_by(HomeTeam) %>%
+  arrange(Date, .by_group = TRUE) %>%
+  mutate(
+    home_xG_avg_3 = lag(rollapply(home_xG, 3, mean, fill = NA, align = "right"))
+  ) %>%
+  ungroup()
+
+pl_xg <- pl_xg %>%
+  group_by(AwayTeam) %>%
+  arrange(Date, .by_group = TRUE) %>%
+  mutate(
+    away_xG_avg_3 = lag(rollapply(away_xG, 3, mean, fill = NA, align = "right"))
+  ) %>%
+  ungroup() %>%
+  mutate(
+    xG_diff_avg_3 = home_xG_avg_3 - away_xG_avg_3
+  )
+```
+
+10 games
+```{r}
+pl_xg <- pl_xg %>%
+  group_by(HomeTeam) %>%
+  arrange(Date, .by_group = TRUE) %>%
+  mutate(
+    home_xG_avg_10 = lag(rollapply(home_xG, 10, mean, fill = NA, align = "right"))
+  ) %>%
+  ungroup()
+
+pl_xg <- pl_xg %>%
+  group_by(AwayTeam) %>%
+  arrange(Date, .by_group = TRUE) %>%
+  mutate(
+    away_xG_avg_10 = lag(rollapply(away_xG, 10, mean, fill = NA, align = "right"))
+  ) %>%
+  ungroup() %>%
+  mutate(
+    xG_diff_avg_10 = home_xG_avg_10 - away_xG_avg_10
+  )
+```
+
+Train test again
+```{r}
+train_xg <- pl_xg %>% filter(Date < as.Date("2023-08-01"))
+test_xg  <- pl_xg %>% filter(Date >= as.Date("2023-08-01"))
+```
+
+Model for 3 games
+```{r}
+model_xg_diff_3 <- glm(
+  home_win ~ p_home + xG_diff_avg_3,
+  data = train_xg %>% filter(!is.na(xG_diff_avg_3)),
+  family = binomial
+)
+
+test_xg_diff_eval_3 <- test_xg %>%
+  filter(!is.na(xG_diff_avg_3)) %>%
+  mutate(
+    pred_xg_diff_3 = predict(model_xg_diff_3, newdata = ., type = "response")
+  )
+
+log_loss(test_xg_diff_eval_3$home_win, test_xg_diff_eval_3$pred_xg_diff_3)
+brier_score(test_xg_diff_eval_3$home_win, test_xg_diff_eval_3$pred_xg_diff_3)
+```
+Model for 10 games
+```{r}
+model_xg_diff_10 <- glm(
+  home_win ~ p_home + xG_diff_avg_10,
+  data = train_xg %>% filter(!is.na(xG_diff_avg_10)),
+  family = binomial
+)
+
+test_xg_diff_eval_10 <- test_xg %>%
+  filter(!is.na(xG_diff_avg_10)) %>%
+  mutate(
+    pred_xg_diff_10 = predict(model_xg_diff_10, newdata = ., type = "response")
+  )
+
+log_loss(test_xg_diff_eval_10$home_win, test_xg_diff_eval_10$pred_xg_diff_10)
+brier_score(test_xg_diff_eval_10$home_win, test_xg_diff_eval_10$pred_xg_diff_10)
+```
+# Summary:
+# Adding xG-based features does not improve predictive performance
+# relative to bookmaker probabilities.
+# This suggests that bookmaker odds already incorporate publicly available
+# performance metrics such as expected goals.
+
+
