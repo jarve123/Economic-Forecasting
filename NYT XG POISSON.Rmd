@@ -1,0 +1,522 @@
+---
+title: "NYT"
+output: html_document
+date: "2026-04-08"
+---
+```{r}
+# ═══════════════════════════════════════════════════════════════
+# EPL HOME WIN PREDICTION MODEL
+# Dependent  : home_win (1 = home win, 0 = draw or away win)
+# Independent: p_home (bookmaker fair probability) + xG rolling features + elo_diff
+#
+# KEY CHANGES FROM PREVIOUS GOAL-PREDICTION CODE:
+#  - One row per match (was: two rows per match)
+#  - home_win is the outcome (was: goals count)
+#  - p_home from bookmaker is a predictor, not just for comparison
+#  - Logistic regression + XGBoost binary:logistic (was: Poisson/NB + count:poisson)
+#  - Simple rolling mean (was: exponentially-weighted rolling mean)
+#  - SD removed entirely (was: sd_xG / opp_sd_xG)
+#  - No Poisson score-matrix conversion step needed
+# ═══════════════════════════════════════════════════════════════
+
+# ── PACKAGES ────────────────────────────────────────────────────
+library(worldfootballR)
+library(tidyverse)
+library(zoo)
+library(xgboost)
+library(purrr)
+
+select <- dplyr::select
+filter <- dplyr::filter
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 1: LOAD & AGGREGATE SHOT-LEVEL xG DATA
+# (same source as before — understat EPL shots)
+# ═══════════════════════════════════════════════════════════════
+
+epl_shots <- load_understat_league_shots(league = "EPL")
+
+match_xg <- epl_shots %>%
+  filter(season >= 2016, season <= 2024) %>%
+  mutate(h_a = coalesce(h_a, home_away)) %>%
+  group_by(match_id, league, season, date, home_team, away_team,
+           home_goals, away_goals) %>%
+  summarise(
+    home_xG_openplay = sum(xG[h_a == "h" & situation == "OpenPlay"],       na.rm = TRUE),
+    away_xG_openplay = sum(xG[h_a == "a" & situation == "OpenPlay"],       na.rm = TRUE),
+    home_xG_freekick = sum(xG[h_a == "h" & situation == "DirectFreekick"], na.rm = TRUE),
+    away_xG_freekick = sum(xG[h_a == "a" & situation == "DirectFreekick"], na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(date)
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 2: RESHAPE TO TEAM LEVEL
+# Still needed to compute per-team rolling averages correctly.
+# (We will collapse back to match-level in Step 4.)
+# ═══════════════════════════════════════════════════════════════
+
+model_df <- bind_rows(
+  match_xg %>% transmute(
+    match_id, season, date,
+    team        = home_team,
+    opponent    = away_team,
+    home_away   = "home",
+    xG_openplay = home_xG_openplay,
+    xG_freekick = home_xG_freekick
+  ),
+  match_xg %>% transmute(
+    match_id, season, date,
+    team        = away_team,
+    opponent    = home_team,
+    home_away   = "away",
+    xG_openplay = away_xG_openplay,
+    xG_freekick = away_xG_freekick
+  )
+) %>%
+  arrange(team, date)
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 3: SIMPLE ROLLING MEANS (last 5 games, plain average)
+#
+# REMOVED vs previous code:
+#  - exp_weights / exponentially-weighted mean (wmean5)
+#  - sd_xG (standard deviation of total xG)
+#
+# Plain rollapply mean is used instead. The lag(1) ensures we
+# only use information available BEFORE the match being predicted.
+# ═══════════════════════════════════════════════════════════════
+
+model_df <- model_df %>%
+  group_by(team) %>%
+  mutate(
+    roll_xG_openplay = lag(rollapply(xG_openplay, 5, mean, fill = NA, align = "right"), 1),
+    roll_xG_freekick = lag(rollapply(xG_freekick, 5, mean, fill = NA, align = "right"), 1)
+  ) %>%
+  ungroup()
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 4: BUILD MATCH-LEVEL DATA FRAME
+#
+# NEW vs previous code:
+#  - One row per match (not two rows per team)
+#  - home_win is the dependent variable (1 = home win, 0 = draw/away win)
+#  - Features are prefixed home_ / away_ instead of opp_
+# ═══════════════════════════════════════════════════════════════
+
+home_feats <- model_df %>%
+  filter(home_away == "home") %>%
+  select(
+    match_id, season, date,
+    home_team            = team,
+    away_team            = opponent,
+    home_roll_xG_openplay = roll_xG_openplay,
+    home_roll_xG_freekick = roll_xG_freekick
+  )
+
+away_feats <- model_df %>%
+  filter(home_away == "away") %>%
+  select(
+    match_id,
+    away_roll_xG_openplay = roll_xG_openplay,
+    away_roll_xG_freekick = roll_xG_freekick
+  )
+
+match_df <- match_xg %>%
+  select(match_id, season, date, home_team, away_team,
+         home_goals, away_goals) %>%
+  mutate(
+    date     = as.Date(date),
+    home_win = as.integer(home_goals > away_goals)   # 1 = win, 0 = draw or loss
+  ) %>%
+  left_join(home_feats, by = c("match_id", "season", "date", "home_team", "away_team")) %>%
+  left_join(away_feats, by = "match_id") %>%
+  drop_na() %>%
+  arrange(date)
+
+cat("Match-level rows:", nrow(match_df), "\n")
+cat("Home win rate:   ", round(mean(match_df$home_win), 3), "\n")
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 5: LOAD BOOKMAKER DATA & COMPUTE p_home
+#
+# p_home is the bookmaker's FAIR probability of a home win
+# (overround removed). This is now a PREDICTOR in your model,
+# not just a comparison target.
+# ═══════════════════════════════════════════════════════════════
+
+pl <- readRDS("pl_clean.rds")
+
+team_map <- c(
+  "Man City"      = "Manchester City",
+  "Man United"    = "Manchester United",
+  "Newcastle"     = "Newcastle United",
+  "Nott'm Forest" = "Nottingham Forest",
+  "West Brom"     = "West Bromwich Albion",
+  "Wolves"        = "Wolverhampton Wanderers"
+)
+
+pl_fair <- pl %>%
+  mutate(
+    HomeTeam = recode(HomeTeam, !!!team_map),
+    AwayTeam = recode(AwayTeam, !!!team_map),
+    Date     = as.Date(Date),
+    # Raw implied probabilities
+    impl_home = 1 / B365H,
+    impl_draw = 1 / B365D,
+    impl_away = 1 / B365A,
+    overround = impl_home + impl_draw + impl_away,
+    # Fair (margin-removed) probabilities
+    p_home = impl_home / overround,
+    p_draw = impl_draw / overround,
+    p_away = impl_away / overround
+  ) %>%
+  select(Date, HomeTeam, AwayTeam, p_home, p_draw, p_away)
+
+# Join bookmaker data to match_df
+match_df <- match_df %>%
+  left_join(
+    pl_fair,
+    by = c("date" = "Date", "home_team" = "HomeTeam", "away_team" = "AwayTeam")
+  )
+
+cat("Rows with bookmaker data:", sum(!is.na(match_df$p_home)), "\n")
+cat("Rows missing p_home:     ", sum(is.na(match_df$p_home)),  "\n")
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 6: JOIN ELO RATINGS
+# (same logic as before — fetch per match date from clubelo.com)
+# ═══════════════════════════════════════════════════════════════
+
+elo_by_date <- readRDS("elo_by_date.rds")  # pre-fetched in previous session
+
+elo_name_map <- c(
+  "Man City"   = "Manchester City",
+  "Man United" = "Manchester United",
+  "West Brom"  = "West Bromwich Albion",
+  "Newcastle"  = "Newcastle United",
+  "Wolves"     = "Wolverhampton Wanderers",
+  "Forest"     = "Nottingham Forest"
+)
+
+elo_lookup <- elo_by_date %>%
+  mutate(
+    Club = recode(Club, !!!elo_name_map),
+    date = as.Date(date),
+    Elo  = as.numeric(Elo)
+  ) %>%
+  select(date, Club, Elo)
+
+# Join home and away Elo separately
+match_df <- match_df %>%
+  left_join(elo_lookup %>% rename(elo_home = Elo),
+            by = c("date", "home_team" = "Club")) %>%
+  left_join(elo_lookup %>% rename(elo_away = Elo),
+            by = c("date", "away_team" = "Club")) %>%
+  mutate(elo_diff = elo_home - elo_away)
+
+cat("Missing Elo:", sum(is.na(match_df$elo_diff)), "\n")
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 7: FINAL CLEAN & TRAIN / TEST SPLIT
+# ═══════════════════════════════════════════════════════════════
+
+match_df <- match_df %>%
+  drop_na(p_home, elo_diff,
+          home_roll_xG_openplay, home_roll_xG_freekick,
+          away_roll_xG_openplay, away_roll_xG_freekick)
+
+train_df <- match_df %>% filter(season <= 2022)
+test_df  <- match_df %>% filter(season >= 2023)
+
+cat("Train rows:", nrow(train_df), "| Seasons:", min(train_df$season), "-", max(train_df$season), "\n")
+cat("Test rows: ", nrow(test_df),  "| Seasons:", min(test_df$season),  "-", max(test_df$season),  "\n")
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 8: LOGISTIC REGRESSION MODELS
+#
+# Family = binomial(link = "logit")
+# Dependent  : home_win (binary 0/1)
+# Independent: p_home + xG rolling features + elo_diff
+#
+# Why logistic and not Poisson/NB?
+#  - home_win is binary → logistic is the correct GLM family
+#  - Poisson/NB is for counts (goals); it cannot model 0/1 outcomes
+# ═══════════════════════════════════════════════════════════════
+
+# Model 1 — Bookmaker probability only (benchmark)
+# Tests how well p_home alone predicts home wins
+logit_book <- glm(
+  home_win ~ p_home,
+  data   = train_df,
+  family = binomial(link = "logit")
+)
+summary(logit_book)
+
+# Model 2 — Bookmaker + xG open-play
+logit_xg <- glm(
+  home_win ~
+    p_home +
+    home_roll_xG_openplay +
+    away_roll_xG_openplay,
+  data   = train_df,
+  family = binomial(link = "logit")
+)
+summary(logit_xg)
+
+# Model 3 — Bookmaker + xG open-play + freekick + Elo
+logit_full <- glm(
+  home_win ~
+    p_home +
+    home_roll_xG_openplay +
+    home_roll_xG_freekick +
+    away_roll_xG_openplay +
+    away_roll_xG_freekick +
+    elo_diff,
+  data   = train_df,
+  family = binomial(link = "logit")
+)
+summary(logit_full)
+
+# AIC comparison
+cat("\n=== AIC Comparison ===\n")
+cat("Logit book only:  ", AIC(logit_book), "\n")
+cat("Logit + xG:       ", AIC(logit_xg),   "\n")
+cat("Logit full:       ", AIC(logit_full),  "\n")
+
+# Generate predicted probabilities on test set
+test_df <- test_df %>%
+  mutate(
+    pred_logit_book = predict(logit_book, newdata = test_df, type = "response"),
+    pred_logit_xg   = predict(logit_xg,   newdata = test_df, type = "response"),
+    pred_logit_full = predict(logit_full,  newdata = test_df, type = "response")
+  )
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 9: XGBOOST — BINARY CLASSIFICATION
+#
+# Objective = "binary:logistic" (was: "count:poisson")
+# Outputs a probability directly — no Poisson matrix conversion needed
+# ═══════════════════════════════════════════════════════════════
+
+feature_names <- c(
+  "p_home",
+  "home_roll_xG_openplay", "home_roll_xG_freekick",
+  "away_roll_xG_openplay", "away_roll_xG_freekick",
+  "elo_diff"
+)
+
+train_matrix <- xgb.DMatrix(
+  data  = as.matrix(train_df[, feature_names]),
+  label = train_df$home_win           # binary 0/1
+)
+
+test_matrix <- xgb.DMatrix(
+  data  = as.matrix(test_df[, feature_names]),
+  label = test_df$home_win
+)
+
+xgb_model <- xgb.train(
+  params = list(
+    objective        = "binary:logistic",   # KEY CHANGE from count:poisson
+    eval_metric      = "logloss",
+    eta              = 0.05,
+    max_depth        = 4,
+    subsample        = 0.8,
+    colsample_bytree = 0.8
+  ),
+  data                  = train_matrix,
+  nrounds               = 500,
+  evals                 = list(train = train_matrix, test = test_matrix),
+  early_stopping_rounds = 30,
+  verbose               = 1,
+  print_every_n         = 50
+)
+
+test_df <- test_df %>%
+  mutate(pred_xgb = predict(xgb_model, test_matrix))
+
+# Feature importance
+importance <- xgb.importance(feature_names = feature_names, model = xgb_model)
+xgb.plot.importance(importance)
+print(importance)
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 10: EVALUATE — LOG LOSS & BRIER SCORE
+#
+# Correct metrics for binary probability predictions:
+#  - Log loss (lower = better): penalises confident wrong predictions
+#  - Brier score (lower = better): mean squared error of probabilities
+#
+# We compare each model against the bookmaker's p_home baseline
+# ═══════════════════════════════════════════════════════════════
+
+log_loss <- function(actual, predicted) {
+  p <- pmax(pmin(predicted, 1 - 1e-15), 1e-15)
+  -mean(actual * log(p) + (1 - actual) * log(1 - p))
+}
+
+brier_score <- function(actual, predicted) {
+  mean((actual - predicted)^2)
+}
+
+eval_results <- test_df %>%
+  summarise(
+    # Log loss
+    ll_bookmaker    = log_loss(home_win, p_home),
+    ll_logit_book   = log_loss(home_win, pred_logit_book),
+    ll_logit_xg     = log_loss(home_win, pred_logit_xg),
+    ll_logit_full   = log_loss(home_win, pred_logit_full),
+    ll_xgb          = log_loss(home_win, pred_xgb),
+    # Brier score
+    bs_bookmaker    = brier_score(home_win, p_home),
+    bs_logit_book   = brier_score(home_win, pred_logit_book),
+    bs_logit_xg     = brier_score(home_win, pred_logit_xg),
+    bs_logit_full   = brier_score(home_win, pred_logit_full),
+    bs_xgb          = brier_score(home_win, pred_xgb)
+  )
+
+cat("\n=== Model Evaluation (test set) ===\n")
+cat("                  Log Loss   Brier Score\n")
+cat("Bookmaker (p_home):", round(eval_results$ll_bookmaker,  4),
+    "  ", round(eval_results$bs_bookmaker,  4), "\n")
+cat("Logit book only:   ", round(eval_results$ll_logit_book, 4),
+    "  ", round(eval_results$bs_logit_book, 4), "\n")
+cat("Logit + xG:        ", round(eval_results$ll_logit_xg,   4),
+    "  ", round(eval_results$bs_logit_xg,   4), "\n")
+cat("Logit full:        ", round(eval_results$ll_logit_full,  4),
+    "  ", round(eval_results$bs_logit_full,  4), "\n")
+cat("XGBoost:           ", round(eval_results$ll_xgb,         4),
+    "  ", round(eval_results$bs_xgb,         4), "\n")
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 11: CALIBRATION CHECK
+# Does your model's predicted probability match the actual win rate?
+# A well-calibrated model should have: predicted ~= actual
+# ═══════════════════════════════════════════════════════════════
+
+calibration_df <- test_df %>%
+  mutate(
+    prob_bucket = cut(pred_logit_full,
+                      breaks = seq(0, 1, 0.1),
+                      include.lowest = TRUE)
+  ) %>%
+  group_by(prob_bucket) %>%
+  summarise(
+    n              = n(),
+    avg_predicted  = mean(pred_logit_full),
+    actual_win_rate = mean(home_win),
+    .groups = "drop"
+  )
+
+cat("\n=== Calibration (logit full model) ===\n")
+print(calibration_df)
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 12: EDGE ANALYSIS vs BOOKMAKER
+# edge = your predicted p_home - bookmaker's fair p_home
+# Positive edge → you think home team is MORE likely to win
+# ═══════════════════════════════════════════════════════════════
+
+# Use the best-performing model — adjust this if XGBoost is best
+eval_df <- test_df %>%
+  mutate(
+    edge_logit = pred_logit_full - p_home,
+    edge_xgb   = pred_xgb        - p_home
+  )
+
+edge_analysis <- eval_df %>%
+  mutate(
+    edge_bucket = cut(edge_logit,
+                      breaks = c(-1, -0.2, -0.1, 0, 0.1, 0.2, 1),
+                      labels = c("Strong against", "Mild against", "Neutral low",
+                                 "Neutral high",   "Mild for",     "Strong for"))
+  ) %>%
+  group_by(edge_bucket) %>%
+  summarise(
+    n              = n(),
+    avg_edge       = mean(edge_logit),
+    actual_rate    = mean(home_win),
+    avg_model_prob = mean(pred_logit_full),
+    avg_fair_prob  = mean(p_home),
+    log_loss_model = log_loss(home_win, pred_logit_full),
+    log_loss_book  = log_loss(home_win, p_home),
+    .groups = "drop"
+  )
+
+cat("\n=== Performance by edge size (logit full) ===\n")
+print(edge_analysis)
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 13: SIMULATED BETTING ROI
+# Bet on home win only when your model shows positive edge
+# Returns use fair odds (1/p_home) as a proxy for actual odds
+# ═══════════════════════════════════════════════════════════════
+
+betting_returns <- function(df, edge_threshold, pred_col = "pred_logit_full") {
+  bets <- df %>%
+    mutate(edge = .data[[pred_col]] - p_home) %>%
+    filter(edge > edge_threshold) %>%
+    mutate(
+      decimal_odds = 1 / p_home,
+      profit       = if_else(home_win == 1, decimal_odds - 1, -1)
+    )
+
+  if (nrow(bets) == 0) {
+    return(tibble(threshold = edge_threshold, n_bets = 0,
+                  total_profit = NA, roi = NA, win_rate = NA))
+  }
+
+  tibble(
+    threshold    = edge_threshold,
+    n_bets       = nrow(bets),
+    total_profit = round(sum(bets$profit), 2),
+    roi          = round(sum(bets$profit) / nrow(bets) * 100, 2),
+    win_rate     = round(mean(bets$home_win) * 100, 2),
+    avg_edge     = round(mean(bets$edge), 3)
+  )
+}
+
+roi_logit <- map_dfr(c(0.05, 0.10, 0.15, 0.20, 0.25, 0.30),
+                     ~betting_returns(eval_df, .x, "pred_logit_full"))
+
+roi_xgb   <- map_dfr(c(0.05, 0.10, 0.15, 0.20, 0.25, 0.30),
+                     ~betting_returns(eval_df, .x, "pred_xgb"))
+
+cat("\n=== Simulated ROI — Logit full ===\n")
+print(roi_logit)
+
+cat("\n=== Simulated ROI — XGBoost ===\n")
+print(roi_xgb)
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 14: STATISTICAL TEST — IS YOUR EDGE REAL?
+# ═══════════════════════════════════════════════════════════════
+
+model_losses <- eval_df %>%
+  mutate(
+    loss_model = -(home_win * log(pmax(pred_logit_full, 1e-15)) +
+                   (1-home_win) * log(pmax(1-pred_logit_full, 1e-15))),
+    loss_book  = -(home_win * log(pmax(p_home, 1e-15)) +
+                   (1-home_win) * log(pmax(1-p_home, 1e-15))),
+    diff       = loss_model - loss_book    # negative = model is better
+  )
+
+t_result <- t.test(model_losses$diff, mu = 0)
+
+cat("\n=== Statistical test: model log loss vs bookmaker ===\n")
+cat("Mean difference (model - bookmaker):", round(mean(model_losses$diff), 4), "\n")
+cat("Negative = model is better\n")
+cat("p-value:", round(t_result$p.value, 4), "\n")
+cat("If p < 0.05, the difference is statistically significant\n")
+
+# ═══════════════════════════════════════════════════════════════
+# SAVE OUTPUTS
+# ═══════════════════════════════════════════════════════════════
+
+saveRDS(match_df, "epl_match_df.rds")
+saveRDS(test_df,  "epl_test_results.rds")
+
+cat("\nDone. Files saved.\n")
+```
+
