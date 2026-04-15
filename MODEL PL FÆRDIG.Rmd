@@ -1,0 +1,768 @@
+---
+title: "INDEPENDENT PL DONE"
+output: html_document
+date: "2026-04-15"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Load packages
+```{r}
+library(readr)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(tibble)
+library(MASS)
+library(xgboost)
+```
+
+Helper functions
+```{r}
+log_loss <- function(actual, predicted) {
+  predicted <- pmax(pmin(predicted, 1 - 1e-15), 1e-15)
+  -mean(actual * log(predicted) + (1 - actual) * log(1 - predicted))
+}
+
+brier_score <- function(actual, predicted) {
+  mean((actual - predicted)^2)
+}
+
+clip_prob <- function(p) {
+  pmin(pmax(p, 1e-6), 1 - 1e-6)
+}
+
+make_fair_probs <- function(home_odds, draw_odds, away_odds) {
+  raw_home <- 1 / home_odds
+  raw_draw <- 1 / draw_odds
+  raw_away <- 1 / away_odds
+  
+  overround <- raw_home + raw_draw + raw_away
+  
+  tibble(
+    fair_home = raw_home / overround,
+    fair_draw = raw_draw / overround,
+    fair_away = raw_away / overround
+  )
+}
+
+match_probs <- function(lambda_home, lambda_away, max_goals = 10) {
+  g <- 0:max_goals
+  score_matrix <- outer(dpois(g, lambda_home), dpois(g, lambda_away))
+  
+  list(
+    prob_home = sum(score_matrix[lower.tri(score_matrix)]),
+    prob_draw = sum(diag(score_matrix)),
+    prob_away = sum(score_matrix[upper.tri(score_matrix)])
+  )
+}
+
+make_calibration_table <- function(actual, pred, bucket_width = 0.1) {
+  tibble(actual = actual, pred = pred) %>%
+    filter(!is.na(actual), !is.na(pred)) %>%
+    mutate(
+      prob_bucket = cut(
+        pred,
+        breaks = seq(0, 1, by = bucket_width),
+        include.lowest = TRUE
+      )
+    ) %>%
+    group_by(prob_bucket) %>%
+    summarise(
+      n = n(),
+      avg_pred = mean(pred),
+      actual_rate = mean(actual),
+      .groups = "drop"
+    )
+}
+
+add_profit <- function(df) {
+  df %>%
+    mutate(
+      odds = 1 / fair_home,
+      profit = if_else(home_win.y == 1, odds - 1, -1)
+    )
+}
+```
+
+Load data
+```{r}
+pl <- readRDS("pl_clean.rds")
+team_match_df <- readRDS("epl_team_match_df.rds")
+```
+
+Align team names and clean bookmaker data
+```{r}
+team_map <- c(
+  "Man City" = "Manchester City",
+  "Man United" = "Manchester United",
+  "Newcastle" = "Newcastle United",
+  "Nott'm Forest" = "Nottingham Forest",
+  "West Brom" = "West Bromwich Albion",
+  "Wolves" = "Wolverhampton Wanderers"
+)
+
+pl <- pl %>%
+  mutate(
+    HomeTeam = recode(HomeTeam, !!!team_map),
+    AwayTeam = recode(AwayTeam, !!!team_map),
+    Date = as.Date(Date),
+    home_win = as.integer(FTR == "H")
+  )
+```
+
+Create bookmaker fair probabilities
+```{r}
+fair_probs <- make_fair_probs(pl$B365H, pl$B365D, pl$B365A)
+
+pl <- bind_cols(pl, fair_probs)
+```
+
+Keep only required columns
+```{r}
+feature_names <- c(
+  "roll_xG_openplay",
+  "roll_xG_freekick",
+  "opp_roll_xG_openplay",
+  "opp_roll_xG_freekick",
+  "sd_xG",
+  "opp_sd_xG",
+  "home_flag"
+)
+
+required_cols <- c(
+  "match_id", "season", "date", "team", "opponent", "goals", feature_names
+)
+
+team_match_df <- team_match_df %>%
+  select(all_of(required_cols)) %>%
+  mutate(date = as.Date(date)) %>%
+  drop_na()
+```
+
+Train/test split
+```{r}
+train_df <- team_match_df %>%
+  filter(season <= 2022)
+
+test_df <- team_match_df %>%
+  filter(season >= 2023)
+
+cat("Train rows:", nrow(train_df), "\n")
+cat("Test rows: ", nrow(test_df), "\n")
+```
+
+Fit Negative Binomial model
+```{r}
+nb_model <- glm.nb(
+  goals ~
+    roll_xG_openplay +
+    roll_xG_freekick +
+    opp_roll_xG_openplay +
+    opp_roll_xG_freekick +
+    sd_xG +
+    opp_sd_xG +
+    home_flag,
+  data = train_df
+)
+
+summary(nb_model)
+cat("Theta:", nb_model$theta, "\n")
+```
+
+Predict team-level expected goals with NB
+```{r}
+train_df <- train_df %>%
+  mutate(pred_nb = predict(nb_model, newdata = train_df, type = "response"))
+
+test_df <- test_df %>%
+  mutate(pred_nb = predict(nb_model, newdata = test_df, type = "response"))
+```
+
+Fit XGBoost model
+```{r}
+train_matrix <- xgb.DMatrix(
+  data = as.matrix(train_df[, feature_names]),
+  label = train_df$goals
+)
+
+test_matrix <- xgb.DMatrix(
+  data = as.matrix(test_df[, feature_names]),
+  label = test_df$goals
+)
+
+watchlist <- list(
+  train = train_matrix,
+  test  = test_matrix
+)
+
+xgb_model <- xgb.train(
+  params = list(
+    objective = "count:poisson",
+    eta = 0.05,
+    max_depth = 4,
+    subsample = 0.8,
+    colsample_bytree = 0.8,
+    eval_metric = "poisson-nloglik"
+  ),
+  data = train_matrix,
+  nrounds = 500,
+  watchlist = watchlist,
+  early_stopping_rounds = 30,
+  verbose = 1,
+  print_every_n = 50
+)
+```
+Predict team-level expected goals with XGBoost
+```{r}
+train_df <- train_df %>%
+  mutate(pred_xgb = predict(xgb_model, train_matrix))
+
+test_df <- test_df %>%
+  mutate(pred_xgb = predict(xgb_model, test_matrix))
+```
+
+Convert team-level predictions to match-level rows: train
+```{r}
+home_train <- train_df %>%
+  filter(home_flag == 1) %>%
+  select(
+    match_id, date, season,
+    home_team = team,
+    away_team = opponent,
+    home_goals = goals,
+    lambda_home_nb = pred_nb,
+    lambda_home_xgb = pred_xgb
+  )
+
+away_train <- train_df %>%
+  filter(home_flag == 0) %>%
+  select(
+    match_id,
+    away_goals = goals,
+    lambda_away_nb = pred_nb,
+    lambda_away_xgb = pred_xgb
+  )
+
+match_train <- home_train %>%
+  left_join(away_train, by = "match_id") %>%
+  mutate(
+    actual_result = case_when(
+      home_goals > away_goals ~ "home",
+      home_goals == away_goals ~ "draw",
+      TRUE ~ "away"
+    ),
+    home_win = as.integer(actual_result == "home")
+  )
+```
+
+Convet team-level predictions to match-level rows: test
+```{r}
+home_test <- test_df %>%
+  filter(home_flag == 1) %>%
+  select(
+    match_id, date, season,
+    home_team = team,
+    away_team = opponent,
+    home_goals = goals,
+    lambda_home_nb = pred_nb,
+    lambda_home_xgb = pred_xgb
+  )
+
+away_test <- test_df %>%
+  filter(home_flag == 0) %>%
+  select(
+    match_id,
+    away_goals = goals,
+    lambda_away_nb = pred_nb,
+    lambda_away_xgb = pred_xgb
+  )
+
+match_test <- home_test %>%
+  left_join(away_test, by = "match_id") %>%
+  mutate(
+    actual_result = case_when(
+      home_goals > away_goals ~ "home",
+      home_goals == away_goals ~ "draw",
+      TRUE ~ "away"
+    ),
+    home_win = as.integer(actual_result == "home")
+  )
+```
+
+Convert expected goals to match probabilities: train
+```{r}
+probs_train_nb <- pmap_dfr(
+  list(match_train$lambda_home_nb, match_train$lambda_away_nb),
+  function(lh, la) {
+    p <- match_probs(lh, la)
+    tibble(
+      p_home_nb = p$prob_home,
+      p_draw_nb = p$prob_draw,
+      p_away_nb = p$prob_away
+    )
+  }
+)
+
+probs_train_xgb <- pmap_dfr(
+  list(match_train$lambda_home_xgb, match_train$lambda_away_xgb),
+  function(lh, la) {
+    p <- match_probs(lh, la)
+    tibble(
+      p_home_xgb = p$prob_home,
+      p_draw_xgb = p$prob_draw,
+      p_away_xgb = p$prob_away
+    )
+  }
+)
+
+match_train <- bind_cols(match_train, probs_train_nb, probs_train_xgb)
+```
+
+Convert expected goals to match probabilities: test
+```{r}
+probs_test_nb <- pmap_dfr(
+  list(match_test$lambda_home_nb, match_test$lambda_away_nb),
+  function(lh, la) {
+    p <- match_probs(lh, la)
+    tibble(
+      p_home_nb = p$prob_home,
+      p_draw_nb = p$prob_draw,
+      p_away_nb = p$prob_away
+    )
+  }
+)
+
+probs_test_xgb <- pmap_dfr(
+  list(match_test$lambda_home_xgb, match_test$lambda_away_xgb),
+  function(lh, la) {
+    p <- match_probs(lh, la)
+    tibble(
+      p_home_xgb = p$prob_home,
+      p_draw_xgb = p$prob_draw,
+      p_away_xgb = p$prob_away
+    )
+  }
+)
+
+match_test <- bind_cols(match_test, probs_test_nb, probs_test_xgb)
+```
+Merge bookmaker benchmark into train sample
+```{r}
+book_train <- pl %>%
+  filter(Date < as.Date("2023-08-01")) %>%
+  select(
+    Date, HomeTeam, AwayTeam, home_win,
+    fair_home, fair_draw, fair_away
+  )
+
+match_train <- match_train %>%
+  left_join(
+    book_train,
+    by = c("date" = "Date", "home_team" = "HomeTeam", "away_team" = "AwayTeam")
+  )
+```
+
+Merge bookmaker benchmark into test sample
+```{r}
+book_test <- pl %>%
+  filter(Date >= as.Date("2023-08-01")) %>%
+  select(
+    Date, HomeTeam, AwayTeam, home_win,
+    fair_home, fair_draw, fair_away
+  )
+
+match_test <- match_test %>%
+  left_join(
+    book_test,
+    by = c("date" = "Date", "home_team" = "HomeTeam", "away_team" = "AwayTeam")
+  )
+```
+
+Keep only matched rows
+```{r}
+match_train_eval <- match_train %>%
+  filter(!is.na(fair_home))
+
+match_test_eval <- match_test %>%
+  filter(!is.na(fair_home))
+```
+
+Main out-of-sample comparison
+```{r}
+results_main <- tibble(
+  model = c("Bookmaker", "NB model", "XGBoost model"),
+  log_loss = c(
+    log_loss(match_test_eval$home_win.y, match_test_eval$fair_home),
+    log_loss(match_test_eval$home_win.y, match_test_eval$p_home_nb),
+    log_loss(match_test_eval$home_win.y, match_test_eval$p_home_xgb)
+  ),
+  brier = c(
+    brier_score(match_test_eval$home_win.y, match_test_eval$fair_home),
+    brier_score(match_test_eval$home_win.y, match_test_eval$p_home_nb),
+    brier_score(match_test_eval$home_win.y, match_test_eval$p_home_xgb)
+  )
+)
+
+print(results_main)
+```
+Calibration tables
+```{r}
+cal_book <- make_calibration_table(match_test_eval$home_win.y, match_test_eval$fair_home)
+cal_nb   <- make_calibration_table(match_test_eval$home_win.y, match_test_eval$p_home_nb)
+cal_xgb  <- make_calibration_table(match_test_eval$home_win.y, match_test_eval$p_home_xgb)
+
+cal_book
+cal_nb
+cal_xgb
+```
+
+Subgroup analysis: favourites vs non-favourites
+```{r}
+subgroup_results <- match_test_eval %>%
+  mutate(
+    fav_group = case_when(
+      fair_home >= 0.60 ~ "Strong home favourite",
+      fair_home >= 0.45 ~ "Moderate home favourite",
+      fair_home >= 0.30 ~ "Balanced / slight away favourite",
+      TRUE ~ "Strong away favourite"
+    )
+  ) %>%
+  group_by(fav_group) %>%
+  summarise(
+    n = n(),
+    book_log_loss = log_loss(home_win.y, fair_home),
+    nb_log_loss   = log_loss(home_win.y, p_home_nb),
+    xgb_log_loss  = log_loss(home_win.y, p_home_xgb),
+    .groups = "drop"
+  )
+
+print(subgroup_results)
+```
+Create betting-strategy variables
+```{r}
+match_test_eval <- match_test_eval %>%
+  mutate(
+    lambda_diff_nb = lambda_home_nb - lambda_away_nb,
+    lambda_sum_nb  = lambda_home_nb + lambda_away_nb
+  )
+```
+
+Main betting strategy: mid-range odds + high expected goal intensity
+```{r}
+bets_main <- match_test_eval %>%
+  filter(
+    fair_home > 0.4 & fair_home < 0.6,
+    lambda_sum_nb > quantile(lambda_sum_nb, 0.6, na.rm = TRUE)
+  ) %>%
+  add_profit()
+
+mean(bets_main$profit, na.rm = TRUE)
+nrow(bets_main)
+```
+
+Betting strategy: median split
+```{r}
+bets_total_goals <- match_test_eval %>%
+  filter(
+    fair_home > 0.4 & fair_home < 0.6,
+    lambda_sum_nb > median(lambda_sum_nb, na.rm = TRUE)
+  ) %>%
+  add_profit()
+
+mean(bets_total_goals$profit, na.rm = TRUE)
+nrow(bets_total_goals)
+```
+
+Betting strategy: top 40 percent
+```{r}
+bets_strict <- match_test_eval %>%
+  filter(
+    fair_home > 0.4 & fair_home < 0.6,
+    lambda_sum_nb > quantile(lambda_sum_nb, 0.6, na.rm = TRUE)
+  ) %>%
+  add_profit()
+
+mean(bets_strict$profit, na.rm = TRUE)
+nrow(bets_strict)
+```
+
+Betting strategy: top 30 percent
+```{r}
+bets_stricter <- match_test_eval %>%
+  filter(
+    fair_home > 0.4 & fair_home < 0.6,
+    lambda_sum_nb > quantile(lambda_sum_nb, 0.7, na.rm = TRUE)
+  ) %>%
+  add_profit()
+
+mean(bets_stricter$profit, na.rm = TRUE)
+nrow(bets_stricter)
+```
+
+Betting strategy: low expected goals
+```{r}
+bets_low <- match_test_eval %>%
+  filter(
+    fair_home > 0.4 & fair_home < 0.6,
+    lambda_sum_nb < quantile(lambda_sum_nb, 0.4, na.rm = TRUE)
+  ) %>%
+  add_profit()
+
+mean(bets_low$profit, na.rm = TRUE)
+nrow(bets_low)
+```
+
+Profit by expected goal intensity quintile
+```{r}
+profit_by_bin <- match_test_eval %>%
+  mutate(bin = ntile(lambda_sum_nb, 5)) %>%
+  add_profit() %>%
+  group_by(bin) %>%
+  summarise(
+    avg_profit = mean(profit, na.rm = TRUE),
+    n = n(),
+    .groups = "drop"
+  )
+
+print(profit_by_bin)
+```
+Sample size checks
+```{r}
+sample_size_checks <- tibble(
+  segment = c(
+    "Mid-range odds only",
+    "Mid-range + high total goals (median split)",
+    "Mid-range + top 40% total goals",
+    "Mid-range + top 30% total goals",
+    "Mid-range + low total goals"
+  ),
+  n = c(
+    nrow(match_test_eval %>% filter(fair_home > 0.4 & fair_home < 0.6)),
+    nrow(bets_total_goals),
+    nrow(bets_strict),
+    nrow(bets_stricter),
+    nrow(bets_low)
+  )
+)
+
+print(sample_size_checks)
+```
+Robustness across different expected-goal cutoffs
+```{r}
+robustness_cutoffs <- c(0.50, 0.60, 0.70, 0.80)
+
+robustness_table <- purrr::map_dfr(robustness_cutoffs, function(q) {
+  
+  bets_q <- match_test_eval %>%
+    filter(
+      fair_home > 0.4 & fair_home < 0.6,
+      lambda_sum_nb > quantile(lambda_sum_nb, q, na.rm = TRUE)
+    ) %>%
+    add_profit()
+  
+  tibble(
+    quantile_cutoff = q,
+    n_bets = nrow(bets_q),
+    avg_profit = mean(bets_q$profit, na.rm = TRUE)
+  )
+})
+
+print(robustness_table)
+```
+Robustness across alternative probability ranges
+```{r}
+range_results <- bind_rows(
+  match_test_eval %>%
+    filter(
+      fair_home > 0.35 & fair_home < 0.65,
+      lambda_sum_nb > quantile(lambda_sum_nb, 0.6, na.rm = TRUE)
+    ) %>%
+    add_profit() %>%
+    summarise(range = "0.35-0.65", n_bets = n(), avg_profit = mean(profit, na.rm = TRUE)),
+  
+  match_test_eval %>%
+    filter(
+      fair_home > 0.40 & fair_home < 0.60,
+      lambda_sum_nb > quantile(lambda_sum_nb, 0.6, na.rm = TRUE)
+    ) %>%
+    add_profit() %>%
+    summarise(range = "0.40-0.60", n_bets = n(), avg_profit = mean(profit, na.rm = TRUE)),
+  
+  match_test_eval %>%
+    filter(
+      fair_home > 0.45 & fair_home < 0.55,
+      lambda_sum_nb > quantile(lambda_sum_nb, 0.6, na.rm = TRUE)
+    ) %>%
+    add_profit() %>%
+    summarise(range = "0.45-0.55", n_bets = n(), avg_profit = mean(profit, na.rm = TRUE))
+)
+
+print(range_results)
+```
+Heterogeneity across seasons
+```{r}
+season_results <- match_test_eval %>%
+  filter(
+    fair_home > 0.4 & fair_home < 0.6,
+    lambda_sum_nb > quantile(lambda_sum_nb, 0.6, na.rm = TRUE)
+  ) %>%
+  add_profit() %>%
+  group_by(season) %>%
+  summarise(
+    n_bets = n(),
+    avg_profit = mean(profit, na.rm = TRUE),
+    actual_home_win = mean(home_win.y),
+    avg_book_prob = mean(fair_home),
+    .groups = "drop"
+  )
+
+print(season_results)
+```
+Heterogeneity within the mid-range segment
+```{r}
+mid_bin_results <- match_test_eval %>%
+  filter(
+    fair_home > 0.4 & fair_home < 0.6,
+    lambda_sum_nb > quantile(lambda_sum_nb, 0.6, na.rm = TRUE)
+  ) %>%
+  add_profit() %>%
+  mutate(
+    prob_bin = cut(
+      fair_home,
+      breaks = c(0.4, 0.45, 0.5, 0.55, 0.6),
+      include.lowest = TRUE
+    )
+  ) %>%
+  group_by(prob_bin) %>%
+  summarise(
+    n_bets = n(),
+    avg_profit = mean(profit, na.rm = TRUE),
+    actual_home_win = mean(home_win.y),
+    avg_book_prob = mean(fair_home),
+    .groups = "drop"
+  )
+
+print(mid_bin_results)
+```
+Direct comparison: high vs low expected goals
+```{r}
+high_low_comparison <- bind_rows(
+  match_test_eval %>%
+    filter(
+      fair_home > 0.4 & fair_home < 0.6,
+      lambda_sum_nb > quantile(lambda_sum_nb, 0.6, na.rm = TRUE)
+    ) %>%
+    add_profit() %>%
+    summarise(
+      group = "High expected goals",
+      n_bets = n(),
+      avg_profit = mean(profit, na.rm = TRUE),
+      actual_home_win = mean(home_win.y),
+      avg_book_prob = mean(fair_home)
+    ),
+  
+  match_test_eval %>%
+    filter(
+      fair_home > 0.4 & fair_home < 0.6,
+      lambda_sum_nb < quantile(lambda_sum_nb, 0.4, na.rm = TRUE)
+    ) %>%
+    add_profit() %>%
+    summarise(
+      group = "Low expected goals",
+      n_bets = n(),
+      avg_profit = mean(profit, na.rm = TRUE),
+      actual_home_win = mean(home_win.y),
+      avg_book_prob = mean(fair_home)
+    )
+)
+
+print(high_low_comparison)
+```
+Check whether returns are concentrated in a few bets
+```{r}
+bets_concentration <- match_test_eval %>%
+  filter(
+    fair_home > 0.4 & fair_home < 0.6,
+    lambda_sum_nb > quantile(lambda_sum_nb, 0.6, na.rm = TRUE)
+  ) %>%
+  add_profit()
+
+summary(bets_concentration$profit)
+
+quantile(
+  bets_concentration$profit,
+  probs = c(0, 0.1, 0.25, 0.5, 0.75, 0.9, 1),
+  na.rm = TRUE
+)
+```
+Bootstrap confidence interval for average profit
+```{r}
+set.seed(123)
+
+bets_boot <- match_test_eval %>%
+  filter(
+    fair_home > 0.4 & fair_home < 0.6,
+    lambda_sum_nb > quantile(lambda_sum_nb, 0.6, na.rm = TRUE)
+  ) %>%
+  add_profit()
+
+boot_means <- replicate(2000, {
+  sample_profit <- sample(bets_boot$profit, size = nrow(bets_boot), replace = TRUE)
+  mean(sample_profit, na.rm = TRUE)
+})
+
+quantile(boot_means, probs = c(0.025, 0.5, 0.975))
+```
+
+Placebo test
+```{r}
+set.seed(123)
+
+target_n <- nrow(
+  match_test_eval %>%
+    filter(
+      fair_home > 0.4 & fair_home < 0.6,
+      lambda_sum_nb > quantile(lambda_sum_nb, 0.6, na.rm = TRUE)
+    )
+)
+
+all_mid_bets <- match_test_eval %>%
+  filter(fair_home > 0.4 & fair_home < 0.6) %>%
+  add_profit()
+
+placebo_means <- replicate(2000, {
+  placebo_sample <- all_mid_bets %>%
+    slice_sample(n = target_n, replace = FALSE)
+  mean(placebo_sample$profit, na.rm = TRUE)
+})
+
+quantile(placebo_means, probs = c(0.025, 0.5, 0.975))
+
+mean(
+  match_test_eval %>%
+    filter(
+      fair_home > 0.4 & fair_home < 0.6,
+      lambda_sum_nb > quantile(lambda_sum_nb, 0.6, na.rm = TRUE)
+    ) %>%
+    add_profit() %>%
+    pull(profit)
+)
+```
+
+Wider strategy check
+```{r}
+bets_wider <- match_test_eval %>%
+  filter(
+    fair_home > 0.35 & fair_home < 0.65,
+    lambda_sum_nb > quantile(lambda_sum_nb, 0.5, na.rm = TRUE)
+  ) %>%
+  add_profit()
+
+mean(bets_wider$profit, na.rm = TRUE)
+nrow(bets_wider)
+t.test(bets_wider$profit)
+```
+
