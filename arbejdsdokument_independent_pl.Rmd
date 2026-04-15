@@ -1,0 +1,1382 @@
+---
+title: "independent model"
+output: html_document
+date: "2026-04-15"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Load packages
+```{r}
+library(readr)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(tibble)
+library(MASS)
+library(xgboost)
+```
+Helper functions
+```{r}
+log_loss <- function(actual, predicted) {
+  predicted <- pmax(pmin(predicted, 1 - 1e-15), 1e-15)
+  -mean(actual * log(predicted) + (1 - actual) * log(1 - predicted))
+}
+
+brier_score <- function(actual, predicted) {
+  mean((actual - predicted)^2)
+}
+
+clip_prob <- function(p) {
+  pmin(pmax(p, 1e-6), 1 - 1e-6)
+}
+
+# Remove bookmaker margin from 1X2 odds
+make_fair_probs <- function(home_odds, draw_odds, away_odds) {
+  raw_home <- 1 / home_odds
+  raw_draw <- 1 / draw_odds
+  raw_away <- 1 / away_odds
+  
+  overround <- raw_home + raw_draw + raw_away
+  
+  tibble(
+    fair_home = raw_home / overround,
+    fair_draw = raw_draw / overround,
+    fair_away = raw_away / overround
+  )
+}
+
+# Convert predicted home/away goal means into home/draw/away probabilities
+match_probs <- function(lambda_home, lambda_away, max_goals = 10) {
+  g <- 0:max_goals
+  score_matrix <- outer(dpois(g, lambda_home), dpois(g, lambda_away))
+  
+  list(
+    prob_home = sum(score_matrix[lower.tri(score_matrix)]),
+    prob_draw = sum(diag(score_matrix)),
+    prob_away = sum(score_matrix[upper.tri(score_matrix)])
+  )
+}
+```
+
+Load data
+```{r}
+pl <- readRDS("pl_clean.rds")
+team_match_df <- readRDS("epl_team_match_df.rds")
+```
+
+Align team names and clean bookmaker data
+```{r}
+team_map <- c(
+  "Man City" = "Manchester City",
+  "Man United" = "Manchester United",
+  "Newcastle" = "Newcastle United",
+  "Nott'm Forest" = "Nottingham Forest",
+  "West Brom" = "West Bromwich Albion",
+  "Wolves" = "Wolverhampton Wanderers"
+)
+
+pl <- pl %>%
+  mutate(
+    HomeTeam = recode(HomeTeam, !!!team_map),
+    AwayTeam = recode(AwayTeam, !!!team_map),
+    Date = as.Date(Date),
+    home_win = as.integer(FTR == "H")
+  )
+```
+
+Create bookmaker fair probabilities
+```{r}
+fair_probs <- make_fair_probs(pl$B365H, pl$B365D, pl$B365A)
+
+pl <- bind_cols(pl, fair_probs)
+```
+
+Check variables in team-level data
+```{r}
+names(team_match_df)
+```
+Keep only needed columns
+```{r}
+feature_names <- c(
+  "roll_xG_openplay",
+  "roll_xG_freekick",
+  "opp_roll_xG_openplay",
+  "opp_roll_xG_freekick",
+  "sd_xG",
+  "opp_sd_xG",
+  "home_flag"
+)
+
+required_cols <- c(
+  "match_id", "season", "date", "team", "opponent", "goals", feature_names
+)
+
+team_match_df <- team_match_df %>%
+  select(all_of(required_cols)) %>%
+  mutate(date = as.Date(date)) %>%
+  drop_na()
+```
+
+Train/test split
+```{r}
+train_df <- team_match_df %>%
+  filter(season <= 2022)
+
+test_df <- team_match_df %>%
+  filter(season >= 2023)
+
+cat("Train rows:", nrow(train_df), "\n")
+cat("Test rows: ", nrow(test_df), "\n")
+```
+
+Fit Negative Binomial model
+```{r}
+nb_model <- glm.nb(
+  goals ~
+    roll_xG_openplay +
+    roll_xG_freekick +
+    opp_roll_xG_openplay +
+    opp_roll_xG_freekick +
+    sd_xG +
+    opp_sd_xG +
+    home_flag,
+  data = train_df
+)
+
+summary(nb_model)
+cat("Theta:", nb_model$theta, "\n")
+```
+Predict team-level expected goals with NB
+```{r}
+train_matrix <- xgb.DMatrix(
+  data = as.matrix(train_df[, feature_names]),
+  label = train_df$goals
+)
+
+test_matrix <- xgb.DMatrix(
+  data = as.matrix(test_df[, feature_names]),
+  label = test_df$goals
+)
+
+watchlist <- list(
+  train = train_matrix,
+  test  = test_matrix
+)
+
+xgb_model <- xgb.train(
+  params = list(
+    objective = "count:poisson",
+    eta = 0.05,
+    max_depth = 4,
+    subsample = 0.8,
+    colsample_bytree = 0.8,
+    eval_metric = "poisson-nloglik"
+  ),
+  data = train_matrix,
+  nrounds = 500,
+  watchlist = watchlist,
+  early_stopping_rounds = 30,
+  verbose = 1,
+  print_every_n = 50
+)
+```
+Predict team-level expected goals with XGBoost
+```{r}
+train_df <- train_df %>%
+  mutate(pred_xgb = predict(xgb_model, train_matrix))
+
+test_df <- test_df %>%
+  mutate(pred_xgb = predict(xgb_model, test_matrix))
+```
+
+Convert team-level predictions to match-level rows
+```{r}
+home_train <- train_df %>%
+  filter(home_flag == 1) %>%
+  select(
+    match_id, date, season,
+    home_team = team,
+    away_team = opponent,
+    home_goals = goals,
+    lambda_home_nb = pred_nb,
+    lambda_home_xgb = pred_xgb
+  )
+
+away_train <- train_df %>%
+  filter(home_flag == 0) %>%
+  select(
+    match_id,
+    away_goals = goals,
+    lambda_away_nb = pred_nb,
+    lambda_away_xgb = pred_xgb
+  )
+
+match_train <- home_train %>%
+  left_join(away_train, by = "match_id") %>%
+  mutate(
+    actual_result = case_when(
+      home_goals > away_goals ~ "home",
+      home_goals == away_goals ~ "draw",
+      TRUE ~ "away"
+    ),
+    home_win = as.integer(actual_result == "home")
+  )
+```
+
+Same for test sample
+```{r}
+home_test <- test_df %>%
+  filter(home_flag == 1) %>%
+  select(
+    match_id, date, season,
+    home_team = team,
+    away_team = opponent,
+    home_goals = goals,
+    lambda_home_nb = pred_nb,
+    lambda_home_xgb = pred_xgb
+  )
+
+away_test <- test_df %>%
+  filter(home_flag == 0) %>%
+  select(
+    match_id,
+    away_goals = goals,
+    lambda_away_nb = pred_nb,
+    lambda_away_xgb = pred_xgb
+  )
+
+match_test <- home_test %>%
+  left_join(away_test, by = "match_id") %>%
+  mutate(
+    actual_result = case_when(
+      home_goals > away_goals ~ "home",
+      home_goals == away_goals ~ "draw",
+      TRUE ~ "away"
+    ),
+    home_win = as.integer(actual_result == "home")
+  )
+```
+
+Convert expected goals to home/draw/away probabilities
+```{r}
+probs_train_nb <- pmap_dfr(
+  list(match_train$lambda_home_nb, match_train$lambda_away_nb),
+  function(lh, la) {
+    p <- match_probs(lh, la)
+    tibble(
+      p_home_nb = p$prob_home,
+      p_draw_nb = p$prob_draw,
+      p_away_nb = p$prob_away
+    )
+  }
+)
+
+probs_train_xgb <- pmap_dfr(
+  list(match_train$lambda_home_xgb, match_train$lambda_away_xgb),
+  function(lh, la) {
+    p <- match_probs(lh, la)
+    tibble(
+      p_home_xgb = p$prob_home,
+      p_draw_xgb = p$prob_draw,
+      p_away_xgb = p$prob_away
+    )
+  }
+)
+
+match_train <- bind_cols(match_train, probs_train_nb, probs_train_xgb)
+```
+
+Same probability conversion for test
+```{r}
+probs_test_nb <- pmap_dfr(
+  list(match_test$lambda_home_nb, match_test$lambda_away_nb),
+  function(lh, la) {
+    p <- match_probs(lh, la)
+    tibble(
+      p_home_nb = p$prob_home,
+      p_draw_nb = p$prob_draw,
+      p_away_nb = p$prob_away
+    )
+  }
+)
+
+probs_test_xgb <- pmap_dfr(
+  list(match_test$lambda_home_xgb, match_test$lambda_away_xgb),
+  function(lh, la) {
+    p <- match_probs(lh, la)
+    tibble(
+      p_home_xgb = p$prob_home,
+      p_draw_xgb = p$prob_draw,
+      p_away_xgb = p$prob_away
+    )
+  }
+)
+
+match_test <- bind_cols(match_test, probs_test_nb, probs_test_xgb)
+```
+
+Merge bookmaker benchmarak into train sample
+```{r}
+book_train <- pl %>%
+  filter(Date < as.Date("2023-08-01")) %>%
+  select(
+    Date, HomeTeam, AwayTeam, home_win,
+    fair_home, fair_draw, fair_away
+  )
+
+match_train <- match_train %>%
+  left_join(
+    book_train,
+    by = c("date" = "Date", "home_team" = "HomeTeam", "away_team" = "AwayTeam")
+  )
+```
+
+Merge bookmaker benchmark into test sample
+```{r}
+book_test <- pl %>%
+  filter(Date >= as.Date("2023-08-01")) %>%
+  select(
+    Date, HomeTeam, AwayTeam, home_win,
+    fair_home, fair_draw, fair_away
+  )
+
+match_test <- match_test %>%
+  left_join(
+    book_test,
+    by = c("date" = "Date", "home_team" = "HomeTeam", "away_team" = "AwayTeam")
+  )
+```
+
+Check successful merge
+```{r}
+cat("Train matches with bookmaker odds:", sum(!is.na(match_train$fair_home)), "out of", nrow(match_train), "\n")
+cat("Test matches with bookmaker odds: ", sum(!is.na(match_test$fair_home)), "out of", nrow(match_test), "\n")
+```
+Keep only matched rows
+```{r}
+match_train_eval <- match_train %>%
+  filter(!is.na(fair_home))
+
+match_test_eval <- match_test %>%
+  filter(!is.na(fair_home))
+```
+
+Main out-of-sample comparison: bookmaker vs NB vs XGBoost
+```{r}
+results_main <- tibble(
+  model = c("Bookmaker", "NB model", "XGBoost model"),
+  log_loss = c(
+    log_loss(match_test_eval$home_win.y, match_test_eval$fair_home),
+    log_loss(match_test_eval$home_win.y, match_test_eval$p_home_nb),
+    log_loss(match_test_eval$home_win.y, match_test_eval$p_home_xgb)
+  ),
+  brier = c(
+    brier_score(match_test_eval$home_win.y, match_test_eval$fair_home),
+    brier_score(match_test_eval$home_win.y, match_test_eval$p_home_nb),
+    brier_score(match_test_eval$home_win.y, match_test_eval$p_home_xgb)
+  )
+)
+
+results_main
+```
+
+Estimated combination model on training data
+```{r}
+logit <- function(p) {
+  p <- clip_prob(p)
+  log(p / (1 - p))
+}
+
+match_train_eval <- match_train_eval %>%
+  mutate(
+    logit_book = logit(fair_home),
+    logit_nb = logit(p_home_nb),
+    logit_xgb = logit(p_home_xgb)
+  )
+
+match_test_eval <- match_test_eval %>%
+  mutate(
+    logit_book = logit(fair_home),
+    logit_nb = logit(p_home_nb),
+    logit_xgb = logit(p_home_xgb)
+  )
+```
+
+Combination: bookmaker + NB
+```{r}
+combo_nb <- glm(
+  home_win.y ~ logit_book + logit_nb,
+  data = match_train_eval,
+  family = binomial
+)
+
+summary(combo_nb)
+```
+Predict combined NB model on test
+```{r}
+match_test_eval <- match_test_eval %>%
+  mutate(
+    p_combo_nb = predict(combo_nb, newdata = ., type = "response")
+  )
+```
+
+Combination: bookmaker + XGboost
+```{r}
+combo_xgb <- glm(
+  home_win.y ~ logit_book + logit_xgb,
+  data = match_train_eval,
+  family = binomial
+)
+
+summary(combo_xgb)
+```
+Predict combined XGboost model on test
+```{r}
+match_test_eval <- match_test_eval %>%
+  mutate(
+    p_combo_xgb = predict(combo_xgb, newdata = ., type = "response")
+  )
+```
+
+Extended results table
+```{r}
+results_extended <- tibble(
+  model = c(
+    "Bookmaker",
+    "NB model",
+    "XGBoost model",
+    "Bookmaker + NB",
+    "Bookmaker + XGBoost"
+  ),
+  log_loss = c(
+    log_loss(match_test_eval$home_win.y, match_test_eval$fair_home),
+    log_loss(match_test_eval$home_win.y, match_test_eval$p_home_nb),
+    log_loss(match_test_eval$home_win.y, match_test_eval$p_home_xgb),
+    log_loss(match_test_eval$home_win.y, match_test_eval$p_combo_nb),
+    log_loss(match_test_eval$home_win.y, match_test_eval$p_combo_xgb)
+  ),
+  brier = c(
+    brier_score(match_test_eval$home_win.y, match_test_eval$fair_home),
+    brier_score(match_test_eval$home_win.y, match_test_eval$p_home_nb),
+    brier_score(match_test_eval$home_win.y, match_test_eval$p_home_xgb),
+    brier_score(match_test_eval$home_win.y, match_test_eval$p_combo_nb),
+    brier_score(match_test_eval$home_win.y, match_test_eval$p_combo_xgb)
+  )
+)
+
+results_extended
+```
+Calibration table function
+```{r}
+make_calibration_table <- function(actual, pred, bucket_width = 0.1) {
+  tibble(actual = actual, pred = pred) %>%
+    filter(!is.na(actual), !is.na(pred)) %>%
+    mutate(
+      prob_bucket = cut(
+        pred,
+        breaks = seq(0, 1, by = bucket_width),
+        include.lowest = TRUE
+      )
+    ) %>%
+    group_by(prob_bucket) %>%
+    summarise(
+      n = n(),
+      avg_pred = mean(pred),
+      actual_rate = mean(actual),
+      .groups = "drop"
+    )
+}
+```
+
+Calibration tables
+```{r}
+cal_book <- make_calibration_table(match_test_eval$home_win.y, match_test_eval$fair_home)
+cal_nb   <- make_calibration_table(match_test_eval$home_win.y, match_test_eval$p_home_nb)
+cal_xgb  <- make_calibration_table(match_test_eval$home_win.y, match_test_eval$p_home_xgb)
+
+cal_book
+cal_nb
+cal_xgb
+```
+Subgroup analysis: favourties vs non-favourites
+```{r}
+subgroup_results <- match_test_eval %>%
+  mutate(
+    fav_group = case_when(
+      fair_home >= 0.60 ~ "Strong home favourite",
+      fair_home >= 0.45 ~ "Moderate home favourite",
+      fair_home >= 0.30 ~ "Balanced / slight away favourite",
+      TRUE ~ "Strong away favourite"
+    )
+  ) %>%
+  group_by(fav_group) %>%
+  summarise(
+    n = n(),
+    book_log_loss = log_loss(home_win.y, fair_home),
+    nb_log_loss   = log_loss(home_win.y, p_home_nb),
+    xgb_log_loss  = log_loss(home_win.y, p_home_xgb),
+    .groups = "drop"
+  )
+
+subgroup_results
+```
+Identify matches where our model disagrees most with bookmaker
+```{r}
+edge_table <- match_test_eval %>%
+  mutate(
+    edge_nb = p_home_nb - fair_home,
+    edge_xgb = p_home_xgb - fair_home
+  ) %>%
+  arrange(desc(abs(edge_nb))) %>%
+  select(
+    date, home_team, away_team,
+    home_goals, away_goals,
+    fair_home, p_home_nb, p_home_xgb,
+    edge_nb, edge_xgb
+  )
+
+head(edge_table, 20)
+```
+
+EXTENSION: KAN VI MODELLERE BOOKMAKERENS FORECAST-FEJL OG BRUGE DET TIL AT LAVE ET FORBEDRET HOME-WIN FORECAST?
+
+Tjek at nødvendige objekter findes
+```{r}
+exists("match_train_eval")
+exists("match_test_eval")
+names(match_train_eval)
+names(match_test_eval)
+```
+Lav bookmakernens forecast error i train og test
+```{r}
+match_train_eval <- match_train_eval %>%
+  mutate(
+    error_book = home_win.y - fair_home
+  )
+
+match_test_eval <- match_test_eval %>%
+  mutate(
+    error_book = home_win.y - fair_home
+  )
+```
+
+Lav centrale difference- og uncertainty-features
+```{r}
+match_train_eval <- match_train_eval %>%
+  mutate(
+    pdiff_nb   = p_home_nb - fair_home,
+    pdiff_xgb  = p_home_xgb - fair_home,
+    lambda_diff_nb  = lambda_home_nb - lambda_away_nb,
+    lambda_sum_nb   = lambda_home_nb + lambda_away_nb,
+    lambda_diff_xgb = lambda_home_xgb - lambda_away_xgb,
+    lambda_sum_xgb  = lambda_home_xgb + lambda_away_xgb
+  )
+
+match_test_eval <- match_test_eval %>%
+  mutate(
+    pdiff_nb   = p_home_nb - fair_home,
+    pdiff_xgb  = p_home_xgb - fair_home,
+    lambda_diff_nb  = lambda_home_nb - lambda_away_nb,
+    lambda_sum_nb   = lambda_home_nb + lambda_away_nb,
+    lambda_diff_xgb = lambda_home_xgb - lambda_away_xgb,
+    lambda_sum_xgb  = lambda_home_xgb + lambda_away_xgb
+  )
+```
+
+Kig på simple sammenhænge først
+```{r}
+summary(lm(error_book ~ pdiff_nb, data = match_train_eval))
+summary(lm(error_book ~ pdiff_xgb, data = match_train_eval))
+summary(lm(error_book ~ lambda_diff_nb, data = match_train_eval))
+summary(lm(error_book ~ lambda_sum_nb, data = match_train_eval))
+```
+Baseline error model
+```{r}
+error_model_1 <- lm(
+  error_book ~ pdiff_nb + lambda_diff_nb + lambda_sum_nb,
+  data = match_train_eval
+)
+
+summary(error_model_1)
+```
+Mere fleksibel error model med nonlinearitet
+```{r}
+error_model_2 <- lm(
+  error_book ~
+    pdiff_nb +
+    I(pdiff_nb^2) +
+    lambda_diff_nb +
+    I(lambda_diff_nb^2) +
+    lambda_sum_nb,
+  data = match_train_eval
+)
+
+summary(error_model_2)
+```
+Error model med både NB og XGBoost signal
+```{r}
+error_model_3 <- lm(
+  error_book ~
+    pdiff_nb +
+    I(pdiff_nb^2) +
+    pdiff_xgb +
+    I(pdiff_xgb^2) +
+    lambda_diff_nb +
+    lambda_sum_nb,
+  data = match_train_eval
+)
+
+summary(error_model_3)
+```
+Error model med interaktioner
+```{r}
+error_model_4 <- lm(
+  error_book ~
+    pdiff_nb * fair_home +
+    lambda_diff_nb * fair_home +
+    lambda_sum_nb,
+  data = match_train_eval
+)
+
+summary(error_model_4)
+```
+Lav korrigerede bookmaker forecasts i test
+```{r}
+match_test_eval <- match_test_eval %>%
+  mutate(
+    error_hat_1 = predict(error_model_1, newdata = .),
+    error_hat_2 = predict(error_model_2, newdata = .),
+    error_hat_3 = predict(error_model_3, newdata = .),
+    error_hat_4 = predict(error_model_4, newdata = .),
+
+    p_adj_1 = clip_prob(fair_home + error_hat_1),
+    p_adj_2 = clip_prob(fair_home + error_hat_2),
+    p_adj_3 = clip_prob(fair_home + error_hat_3),
+    p_adj_4 = clip_prob(fair_home + error_hat_4)
+  )
+```
+
+Sammenlign bookmaker mod korrigerede forecasts
+```{r}
+results_error_models <- tibble(
+  model = c(
+    "Bookmaker",
+    "Adjusted bookmaker: error model 1",
+    "Adjusted bookmaker: error model 2",
+    "Adjusted bookmaker: error model 3",
+    "Adjusted bookmaker: error model 4"
+  ),
+  log_loss = c(
+    log_loss(match_test_eval$home_win.y, match_test_eval$fair_home),
+    log_loss(match_test_eval$home_win.y, match_test_eval$p_adj_1),
+    log_loss(match_test_eval$home_win.y, match_test_eval$p_adj_2),
+    log_loss(match_test_eval$home_win.y, match_test_eval$p_adj_3),
+    log_loss(match_test_eval$home_win.y, match_test_eval$p_adj_4)
+  ),
+  brier = c(
+    brier_score(match_test_eval$home_win.y, match_test_eval$fair_home),
+    brier_score(match_test_eval$home_win.y, match_test_eval$p_adj_1),
+    brier_score(match_test_eval$home_win.y, match_test_eval$p_adj_2),
+    brier_score(match_test_eval$home_win.y, match_test_eval$p_adj_3),
+    brier_score(match_test_eval$home_win.y, match_test_eval$p_adj_4)
+  )
+)
+
+results_error_models
+```
+Kalibrering: bookmaker vs bedste korrigerede model
+```{r}
+make_calibration_table <- function(actual, pred, bucket_width = 0.1) {
+  tibble(actual = actual, pred = pred) %>%
+    filter(!is.na(actual), !is.na(pred)) %>%
+    mutate(
+      prob_bucket = cut(
+        pred,
+        breaks = seq(0, 1, by = bucket_width),
+        include.lowest = TRUE
+      )
+    ) %>%
+    group_by(prob_bucket) %>%
+    summarise(
+      n = n(),
+      avg_pred = mean(pred),
+      actual_rate = mean(actual),
+      .groups = "drop"
+    )
+}
+
+cal_bookmaker <- make_calibration_table(match_test_eval$home_win.y, match_test_eval$fair_home)
+cal_adjusted  <- make_calibration_table(match_test_eval$home_win.y, match_test_eval$p_adj_1)
+
+cal_bookmaker
+cal_adjusted
+```
+Hvor virker justeringen bedst?
+```{r}
+subgroup_error_results <- match_test_eval %>%
+  mutate(
+    fav_group = case_when(
+      fair_home >= 0.60 ~ "Strong home favourite",
+      fair_home >= 0.45 ~ "Moderate home favourite",
+      fair_home >= 0.30 ~ "Balanced / slight away favourite",
+      TRUE ~ "Strong away favourite"
+    )
+  ) %>%
+  group_by(fav_group) %>%
+  summarise(
+    n = n(),
+    book_log_loss = log_loss(home_win.y, fair_home),
+    adj1_log_loss = log_loss(home_win.y, p_adj_1),
+    adj2_log_loss = log_loss(home_win.y, p_adj_2),
+    adj3_log_loss = log_loss(home_win.y, p_adj_3),
+    adj4_log_loss = log_loss(home_win.y, p_adj_4),
+    .groups = "drop"
+  )
+
+subgroup_error_results
+```
+Test om bookmaker-fejl er større i kampe med høj "uenighed" mellem jeres model og bookmaker
+```{r}
+match_test_eval <- match_test_eval %>%
+  mutate(
+    abs_error_book = abs(error_book),
+    abs_edge_nb = abs(pdiff_nb),
+    abs_edge_xgb = abs(pdiff_xgb)
+  )
+
+summary(lm(abs_error_book ~ abs_edge_nb, data = match_test_eval))
+summary(lm(abs_error_book ~ abs_edge_xgb, data = match_test_eval))
+summary(lm(abs_error_book ~ abs_edge_nb + abs_edge_xgb + fair_home, data = match_test_eval))
+```
+Tjek de kampe, hvor error-model justerer mest
+```{r}
+largest_adjustments <- match_test_eval %>%
+  mutate(
+    adjustment = p_adj_3 - fair_home
+  ) %>%
+  arrange(desc(abs(adjustment))) %>%
+  select(
+    date, home_team, away_team,
+    home_goals, away_goals,
+    fair_home, p_home_nb, p_home_xgb, p_adj_3,
+    adjustment
+  )
+
+head(largest_adjustments, 20)
+```
+
+EKSTRA
+
+Combine bookmaker + our model
+```{r}
+# ── Combine bookmaker + model ─────────────────────────
+
+logit_model <- glm(
+  home_win.y ~ fair_home + p_home_nb + p_home_xgb,
+  family = binomial,
+  data = match_train_eval
+)
+
+summary(logit_model)
+```
+Predictions (out-of-sample)
+```{r}
+# ── Predict on test set ───────────────────────────────
+
+match_test_eval <- match_test_eval %>%
+  mutate(
+    p_comb = predict(logit_model, newdata = ., type = "response")
+  )
+```
+
+Compare models
+```{r}
+# ── Model comparison ──────────────────────────────────
+
+results_models <- tibble(
+  model = c("Bookmaker", "NB model", "XGBoost", "Combined model"),
+  log_loss = c(
+    log_loss(match_test_eval$home_win.y, match_test_eval$fair_home),
+    log_loss(match_test_eval$home_win.y, match_test_eval$p_home_nb),
+    log_loss(match_test_eval$home_win.y, match_test_eval$p_home_xgb),
+    log_loss(match_test_eval$home_win.y, match_test_eval$p_comb)
+  ),
+  brier = c(
+    brier_score(match_test_eval$home_win.y, match_test_eval$fair_home),
+    brier_score(match_test_eval$home_win.y, match_test_eval$p_home_nb),
+    brier_score(match_test_eval$home_win.y, match_test_eval$p_home_xgb),
+    brier_score(match_test_eval$home_win.y, match_test_eval$p_comb)
+  )
+)
+
+print(results_models)
+```
+Segment analysis
+```{r}
+# ── Where do models differ? ───────────────────────────
+
+segment_results <- match_test_eval %>%
+  mutate(
+    fav_group = case_when(
+      fair_home > 0.6  ~ "Strong home favourite",
+      fair_home > 0.45 ~ "Moderate home favourite",
+      fair_home > 0.35 ~ "Balanced",
+      TRUE             ~ "Away favourite"
+    )
+  ) %>%
+  group_by(fav_group) %>%
+  summarise(
+    n = n(),
+    book_log_loss = log_loss(home_win.y, fair_home),
+    nb_log_loss   = log_loss(home_win.y, p_home_nb),
+    xgb_log_loss  = log_loss(home_win.y, p_home_xgb),
+    comb_log_loss = log_loss(home_win.y, p_comb)
+  )
+
+print(segment_results)
+```
+Edge analysis
+```{r}
+# ── Model disagreement (true edge test) ───────────────
+
+match_test_eval <- match_test_eval %>%
+  mutate(
+    edge_nb  = p_home_nb  - fair_home,
+    edge_xgb = p_home_xgb - fair_home
+  )
+
+edge_results <- match_test_eval %>%
+  mutate(edge_group = cut(edge_nb,
+                         breaks = c(-1, -0.1, -0.05, 0, 0.05, 0.1, 1))) %>%
+  group_by(edge_group) %>%
+  summarise(
+    n = n(),
+    actual_rate = mean(home_win.y),
+    model_prob  = mean(p_home_nb),
+    market_prob = mean(fair_home)
+  )
+
+print(edge_results)
+```
+ROI test
+```{r}
+# ── Betting strategy based on model disagreement ──────
+
+bet_results <- map_dfr(c(0.02, 0.05, 0.08), function(t) {
+
+  bets <- match_test_eval %>%
+    filter(edge_nb > t) %>%
+    mutate(
+      odds = 1 / fair_home,
+      profit = if_else(home_win.y == 1, odds - 1, -1)
+    )
+
+  tibble(
+    threshold = t,
+    n_bets = nrow(bets),
+    avg_profit = mean(bets$profit, na.rm = TRUE)
+  )
+})
+
+print(bet_results)
+```
+EKSTRA
+
+Calibration test af bookmaker
+```{r}
+calib <- match_test_eval %>%
+  filter(!is.na(fair_home)) %>%
+  mutate(bin = cut(fair_home, breaks = seq(0,1,0.1), include.lowest = TRUE)) %>%
+  group_by(bin) %>%
+  summarise(
+    actual = mean(home_win.y),
+    pred = mean(fair_home),
+    n = n()
+  )
+
+print(calib)
+```
+
+Find edge-segmenter
+```{r}
+match_test_eval %>%
+  mutate(
+    mid = fair_home > 0.4 & fair_home < 0.6
+  ) %>%
+  group_by(mid) %>%
+  summarise(
+    book = log_loss(home_win.y, fair_home),
+    model = log_loss(home_win.y, p_home_nb)
+  )
+```
+
+Betting kun i segment
+```{r}
+bets <- match_test_eval %>%
+  filter(fair_home > 0.4 & fair_home < 0.6) %>%
+  mutate(
+    odds = 1 / fair_home,
+    profit = if_else(home_win.y == 1, odds - 1, -1)
+  )
+
+mean(bets$profit)
+```
+
+Kombineret filter
+```{r}
+bets <- match_test_eval %>%
+  filter(
+    fair_home > 0.4 & fair_home < 0.6,
+    p_home_nb > fair_home   # <-- vigtigt!
+  ) %>%
+  mutate(
+    odds = 1 / fair_home,
+    profit = if_else(home_win.y == 1, odds - 1, -1)
+  )
+
+mean(bets$profit)
+nrow(bets)
+```
+
+Sammenlign med random
+```{r}
+mean(match_test_eval$home_win.y - match_test_eval$fair_home)
+```
+
+```{r}
+# ── Create model-based strength measure ───────────────────────
+
+match_test_eval <- match_test_eval %>%
+  mutate(
+    lambda_diff_nb = lambda_home_nb - lambda_away_nb
+  )
+```
+
+```{r}
+# ── Subgroup test inside mid-range odds segment ───────────────
+
+mid_segment_summary <- match_test_eval %>%
+  filter(fair_home > 0.4 & fair_home < 0.6) %>%
+  mutate(
+    high_strength = lambda_diff_nb > median(lambda_diff_nb, na.rm = TRUE)
+  ) %>%
+  group_by(high_strength) %>%
+  summarise(
+    actual = mean(home_win.y),
+    pred = mean(fair_home),
+    n = n(),
+    .groups = "drop"
+  )
+
+print(mid_segment_summary)
+```
+```{r}
+# ── Betting only in mid-range + high model strength ───────────
+
+bets_strength <- match_test_eval %>%
+  filter(
+    fair_home > 0.4 & fair_home < 0.6
+  ) %>%
+  mutate(
+    lambda_diff_nb = lambda_home_nb - lambda_away_nb,
+    high_strength = lambda_diff_nb > median(lambda_diff_nb, na.rm = TRUE)
+  ) %>%
+  filter(high_strength) %>%
+  mutate(
+    odds = 1 / fair_home,
+    profit = if_else(home_win.y == 1, odds - 1, -1)
+  )
+
+mean(bets_strength$profit, na.rm = TRUE)
+nrow(bets_strength)
+```
+
+```{r}
+# ── Mid-range + model disagreement ────────────────────────────
+
+bets_disagreement <- match_test_eval %>%
+  filter(
+    fair_home > 0.4 & fair_home < 0.6,
+    p_home_nb - fair_home > 0.03
+  ) %>%
+  mutate(
+    odds = 1 / fair_home,
+    profit = if_else(home_win.y == 1, odds - 1, -1)
+  )
+
+mean(bets_disagreement$profit, na.rm = TRUE)
+nrow(bets_disagreement)
+```
+
+```{r}
+# ── Mid-range + high total expected goals ─────────────────────
+
+bets_total_goals <- match_test_eval %>%
+  mutate(
+    lambda_sum_nb = lambda_home_nb + lambda_away_nb
+  ) %>%
+  filter(
+    fair_home > 0.4 & fair_home < 0.6,
+    lambda_sum_nb > median(lambda_sum_nb, na.rm = TRUE)
+  ) %>%
+  mutate(
+    odds = 1 / fair_home,
+    profit = if_else(home_win.y == 1, odds - 1, -1)
+  )
+
+mean(bets_total_goals$profit, na.rm = TRUE)
+nrow(bets_total_goals)
+```
+
+```{r}
+bets_strict <- match_test_eval %>%
+  mutate(lambda_sum_nb = lambda_home_nb + lambda_away_nb) %>%
+  filter(
+    fair_home > 0.4 & fair_home < 0.6,
+    lambda_sum_nb > quantile(lambda_sum_nb, 0.6, na.rm = TRUE)
+  ) %>%
+  mutate(
+    odds = 1 / fair_home,
+    profit = if_else(home_win.y == 1, odds - 1, -1)
+  )
+
+mean(bets_strict$profit)
+nrow(bets_strict)
+```
+
+```{r}
+bets_stricter <- match_test_eval %>%
+  mutate(lambda_sum_nb = lambda_home_nb + lambda_away_nb) %>%
+  filter(
+    fair_home > 0.4 & fair_home < 0.6,
+    lambda_sum_nb > quantile(lambda_sum_nb, 0.7, na.rm = TRUE)
+  ) %>%
+  mutate(
+    odds = 1 / fair_home,
+    profit = if_else(home_win.y == 1, odds - 1, -1)
+  )
+
+mean(bets_stricter$profit)
+nrow(bets_stricter)
+```
+
+```{r}
+bets_low <- match_test_eval %>%
+  mutate(lambda_sum_nb = lambda_home_nb + lambda_away_nb) %>%
+  filter(
+    fair_home > 0.4 & fair_home < 0.6,
+    lambda_sum_nb < quantile(lambda_sum_nb, 0.4, na.rm = TRUE)
+  ) %>%
+  mutate(
+    odds = 1 / fair_home,
+    profit = if_else(home_win.y == 1, odds - 1, -1)
+  )
+
+mean(bets_low$profit)
+nrow(bets_low)
+```
+
+```{r}
+match_test_eval %>%
+  mutate(lambda_sum_nb = lambda_home_nb + lambda_away_nb) %>%
+  mutate(bin = ntile(lambda_sum_nb, 5)) %>%
+  group_by(bin) %>%
+  summarise(
+    profit = mean(
+      if_else(home_win.y == 1, 1/fair_home - 1, -1)
+    ),
+    n = n()
+  )
+```
+Check for sample size i de vigtigste betting-segmenter
+```{r}
+# ── Sample sizes in betting segments ──────────────────────────
+
+sample_size_checks <- tibble(
+  segment = c(
+    "Mid-range odds only",
+    "Mid-range + high total goals (median split)",
+    "Mid-range + top 40% total goals",
+    "Mid-range + top 30% total goals",
+    "Mid-range + low total goals"
+  ),
+  n = c(
+    nrow(match_test_eval %>% filter(fair_home > 0.4 & fair_home < 0.6)),
+    nrow(bets_total_goals),
+    nrow(bets_strict),
+    nrow(bets_stricter),
+    nrow(bets_low)
+  )
+)
+
+print(sample_size_checks)
+```
+Robustness: flere cutoffs for høj expected goal intensity
+```{r}
+# ── Robustness across different lambda_sum cutoffs ────────────
+
+robustness_cutoffs <- c(0.50, 0.60, 0.70, 0.80)
+
+robustness_table <- purrr::map_dfr(robustness_cutoffs, function(q) {
+  
+  bets_q <- match_test_eval %>%
+    mutate(lambda_sum_nb = lambda_home_nb + lambda_away_nb) %>%
+    filter(
+      fair_home > 0.4 & fair_home < 0.6,
+      lambda_sum_nb > quantile(lambda_sum_nb, q, na.rm = TRUE)
+    ) %>%
+    mutate(
+      odds = 1 / fair_home,
+      profit = if_else(home_win.y == 1, odds - 1, -1)
+    )
+  
+  tibble(
+    quantile_cutoff = q,
+    n_bets = nrow(bets_q),
+    avg_profit = mean(bets_q$profit, na.rm = TRUE)
+  )
+})
+
+print(robustness_table)
+```
+Robustness: alternative mid-range definitions
+```{r}
+# ── Robustness across alternative probability ranges ──────────
+
+range_results <- bind_rows(
+  match_test_eval %>%
+    mutate(lambda_sum_nb = lambda_home_nb + lambda_away_nb) %>%
+    filter(fair_home > 0.35 & fair_home < 0.65,
+           lambda_sum_nb > quantile(lambda_sum_nb, 0.6, na.rm = TRUE)) %>%
+    mutate(odds = 1 / fair_home,
+           profit = if_else(home_win.y == 1, odds - 1, -1)) %>%
+    summarise(range = "0.35-0.65", n_bets = n(), avg_profit = mean(profit, na.rm = TRUE)),
+  
+  match_test_eval %>%
+    mutate(lambda_sum_nb = lambda_home_nb + lambda_away_nb) %>%
+    filter(fair_home > 0.40 & fair_home < 0.60,
+           lambda_sum_nb > quantile(lambda_sum_nb, 0.6, na.rm = TRUE)) %>%
+    mutate(odds = 1 / fair_home,
+           profit = if_else(home_win.y == 1, odds - 1, -1)) %>%
+    summarise(range = "0.40-0.60", n_bets = n(), avg_profit = mean(profit, na.rm = TRUE)),
+  
+  match_test_eval %>%
+    mutate(lambda_sum_nb = lambda_home_nb + lambda_away_nb) %>%
+    filter(fair_home > 0.45 & fair_home < 0.55,
+           lambda_sum_nb > quantile(lambda_sum_nb, 0.6, na.rm = TRUE)) %>%
+    mutate(odds = 1 / fair_home,
+           profit = if_else(home_win.y == 1, odds - 1, -1)) %>%
+    summarise(range = "0.45-0.55", n_bets = n(), avg_profit = mean(profit, na.rm = TRUE))
+)
+
+print(range_results)
+```
+Heterogeneity: virker strategien ens på tværs af sæsoner?
+```{r}
+# ── Heterogeneity across seasons ──────────────────────────────
+
+season_results <- match_test_eval %>%
+  mutate(lambda_sum_nb = lambda_home_nb + lambda_away_nb) %>%
+  filter(
+    fair_home > 0.4 & fair_home < 0.6,
+    lambda_sum_nb > quantile(lambda_sum_nb, 0.6, na.rm = TRUE)
+  ) %>%
+  mutate(
+    odds = 1 / fair_home,
+    profit = if_else(home_win.y == 1, odds - 1, -1)
+  ) %>%
+  group_by(season) %>%
+  summarise(
+    n_bets = n(),
+    avg_profit = mean(profit, na.rm = TRUE),
+    actual_home_win = mean(home_win.y),
+    avg_book_prob = mean(fair_home),
+    .groups = "drop"
+  )
+
+print(season_results)
+```
+Heterogeneity: home probability bins inden for high-goal segmentet
+```{r}
+# ── Heterogeneity within the mid-range segment ────────────────
+
+mid_bin_results <- match_test_eval %>%
+  mutate(lambda_sum_nb = lambda_home_nb + lambda_away_nb) %>%
+  filter(
+    fair_home > 0.4 & fair_home < 0.6,
+    lambda_sum_nb > quantile(lambda_sum_nb, 0.6, na.rm = TRUE)
+  ) %>%
+  mutate(
+    prob_bin = cut(
+      fair_home,
+      breaks = c(0.4, 0.45, 0.5, 0.55, 0.6),
+      include.lowest = TRUE
+    ),
+    odds = 1 / fair_home,
+    profit = if_else(home_win.y == 1, odds - 1, -1)
+  ) %>%
+  group_by(prob_bin) %>%
+  summarise(
+    n_bets = n(),
+    avg_profit = mean(profit, na.rm = TRUE),
+    actual_home_win = mean(home_win.y),
+    avg_book_prob = mean(fair_home),
+    .groups = "drop"
+  )
+
+print(mid_bin_results)
+```
+Heterogeneity: compare high- and low-goal enviromnents directly
+```{r}
+# ── Direct comparison: high vs low expected goal intensity ────
+
+high_low_comparison <- bind_rows(
+  match_test_eval %>%
+    mutate(lambda_sum_nb = lambda_home_nb + lambda_away_nb) %>%
+    filter(
+      fair_home > 0.4 & fair_home < 0.6,
+      lambda_sum_nb > quantile(lambda_sum_nb, 0.6, na.rm = TRUE)
+    ) %>%
+    mutate(
+      odds = 1 / fair_home,
+      profit = if_else(home_win.y == 1, odds - 1, -1)
+    ) %>%
+    summarise(
+      group = "High expected goals",
+      n_bets = n(),
+      avg_profit = mean(profit, na.rm = TRUE),
+      actual_home_win = mean(home_win.y),
+      avg_book_prob = mean(fair_home)
+    ),
+  
+  match_test_eval %>%
+    mutate(lambda_sum_nb = lambda_home_nb + lambda_away_nb) %>%
+    filter(
+      fair_home > 0.4 & fair_home < 0.6,
+      lambda_sum_nb < quantile(lambda_sum_nb, 0.4, na.rm = TRUE)
+    ) %>%
+    mutate(
+      odds = 1 / fair_home,
+      profit = if_else(home_win.y == 1, odds - 1, -1)
+    ) %>%
+    summarise(
+      group = "Low expected goals",
+      n_bets = n(),
+      avg_profit = mean(profit, na.rm = TRUE),
+      actual_home_win = mean(home_win.y),
+      avg_book_prob = mean(fair_home)
+    )
+)
+
+print(high_low_comparison)
+```
+Check for concentration risk: kommer profit fra få store gevinster?
+```{r}
+# ── Check whether returns are concentrated in a few bets ──────
+
+bets_concentration <- match_test_eval %>%
+  mutate(lambda_sum_nb = lambda_home_nb + lambda_away_nb) %>%
+  filter(
+    fair_home > 0.4 & fair_home < 0.6,
+    lambda_sum_nb > quantile(lambda_sum_nb, 0.6, na.rm = TRUE)
+  ) %>%
+  mutate(
+    odds = 1 / fair_home,
+    profit = if_else(home_win.y == 1, odds - 1, -1)
+  )
+
+summary(bets_concentration$profit)
+
+quantile(bets_concentration$profit, probs = c(0, 0.1, 0.25, 0.5, 0.75, 0.9, 1), na.rm = TRUE)
+```
+Check for statistical uncertainty: bootstrap mean profit
+```{r}
+# ── Bootstrap confidence interval for average profit ──────────
+
+set.seed(123)
+
+bets_boot <- match_test_eval %>%
+  mutate(lambda_sum_nb = lambda_home_nb + lambda_away_nb) %>%
+  filter(
+    fair_home > 0.4 & fair_home < 0.6,
+    lambda_sum_nb > quantile(lambda_sum_nb, 0.6, na.rm = TRUE)
+  ) %>%
+  mutate(
+    odds = 1 / fair_home,
+    profit = if_else(home_win.y == 1, odds - 1, -1)
+  )
+
+boot_means <- replicate(2000, {
+  sample_profit <- sample(bets_boot$profit, size = nrow(bets_boot), replace = TRUE)
+  mean(sample_profit, na.rm = TRUE)
+})
+
+quantile(boot_means, probs = c(0.025, 0.5, 0.975))
+```
+
+Placebo test
+```{r}
+# ── Placebo test: random bets of the same size ────────────────
+
+set.seed(123)
+
+target_n <- nrow(
+  match_test_eval %>%
+    mutate(lambda_sum_nb = lambda_home_nb + lambda_away_nb) %>%
+    filter(
+      fair_home > 0.4 & fair_home < 0.6,
+      lambda_sum_nb > quantile(lambda_sum_nb, 0.6, na.rm = TRUE)
+    )
+)
+
+all_mid_bets <- match_test_eval %>%
+  filter(fair_home > 0.4 & fair_home < 0.6) %>%
+  mutate(
+    odds = 1 / fair_home,
+    profit = if_else(home_win.y == 1, odds - 1, -1)
+  )
+
+placebo_means <- replicate(2000, {
+  placebo_sample <- all_mid_bets %>%
+    slice_sample(n = target_n, replace = FALSE)
+  mean(placebo_sample$profit, na.rm = TRUE)
+})
+
+quantile(placebo_means, probs = c(0.025, 0.5, 0.975))
+
+mean(
+  match_test_eval %>%
+    mutate(lambda_sum_nb = lambda_home_nb + lambda_away_nb) %>%
+    filter(
+      fair_home > 0.4 & fair_home < 0.6,
+      lambda_sum_nb > quantile(lambda_sum_nb, 0.6, na.rm = TRUE)
+    ) %>%
+    mutate(
+      odds = 1 / fair_home,
+      profit = if_else(home_win.y == 1, odds - 1, -1)
+    ) %>%
+    pull(profit)
+)
+```
+
+```{r}
+# mindre aggressiv strategi
+bets_wider <- match_test_eval %>%
+  mutate(lambda_sum_nb = lambda_home_nb + lambda_away_nb) %>%
+  filter(
+    fair_home > 0.35 & fair_home < 0.65,
+    lambda_sum_nb > quantile(lambda_sum_nb, 0.5, na.rm = TRUE)
+  ) %>%
+  mutate(
+    odds = 1 / fair_home,
+    profit = if_else(home_win.y == 1, odds - 1, -1)
+  )
+
+mean(bets_wider$profit)
+nrow(bets_wider)
+t.test(bets_wider$profit)
+```
+
