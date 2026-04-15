@@ -1401,8 +1401,19 @@ filter <- dplyr::filter
 # ═══════════════════════════════════════════════════════════════
 
 pl           <- readRDS("pl_clean.rds")
-team_match_df <- readRDS("epl_team_match_df.rds")
-
+team_match_df <- readRDS("epl_team_match_df.rds") %>%
+  rename(
+    roll_xG_openplay     = roll_xG_openplay_adj,
+    roll_xG_corner       = roll_xG_corner_adj,
+    roll_xG_freekick     = roll_xG_freekick_adj,
+    roll_xG_penalty      = roll_xG_penalty_adj,
+    roll_xG_setpiece     = roll_xG_setpiece_adj,
+    opp_roll_xG_openplay = opp_roll_xG_openplay_adj,
+    opp_roll_xG_corner   = opp_roll_xG_corner_adj,
+    opp_roll_xG_freekick = opp_roll_xG_freekick_adj,
+    opp_roll_xG_penalty  = opp_roll_xG_penalty_adj,
+    opp_roll_xG_setpiece = opp_roll_xG_setpiece_adj
+  )
 # Team name mapping to align understat vs football-data.co.uk names
 team_map <- c(
   "Man City"      = "Manchester City",
@@ -1804,7 +1815,7 @@ so cross season changes is somewhat accounted for when using elo
 The rolling xg uses cross season.
 
 
-```{r}
+
 # Get all unique match dates in your dataset
 match_dates <- unique(as.Date(team_match_df$date))
 
@@ -1817,7 +1828,11 @@ elo_by_date <- map_dfr(match_dates, function(d) {
     mutate(date = d)
 }, .progress = TRUE)
 
+
+```{r}
+elo_by_date <- readRDS("elo_by_date.rds")
 ```
+
 getting ELO rating from api
 
 ```{r}
