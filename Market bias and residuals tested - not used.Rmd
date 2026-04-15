@@ -1,0 +1,481 @@
+---
+title: "Residual Cluade"
+output: html_document
+date: "2026-04-15"
+---
+
+```{r}
+# Select variables
+pl <- pl_raw %>%
+  select(
+    any_of(c(
+      "Date", "HomeTeam", "AwayTeam",
+      "FTHG", "FTAG", "FTR",
+      "HTHG", "HTAG",
+      "HS", "AS", "HST", "AST",
+      "HF", "AF", "HC", "AC",
+      "HY", "AY", "HR", "AR",
+      "B365H", "B365D", "B365A",
+      "BWH",   "BWD",   "BWA",
+      "IWH",   "IWD",   "IWA",
+      "LBH",   "LBD",   "LBA",
+      "PSH",   "PSD",   "PSA",
+      "WHH",   "WHD",   "WHA",
+      "VCH",   "VCD",   "VCA",
+      "BbMxH", "BbMxD", "BbMxA",
+      "BbAvH", "BbAvD", "BbAvA",
+      "season"
+    ))
+  ) %>%
+  mutate(Date = trimws(Date))
+
+# Parse dates
+pl$Date <- ifelse(
+  nchar(pl$Date) == 8,
+  as.character(as.Date(pl$Date, format = "%d/%m/%y")),
+  as.character(as.Date(pl$Date, format = "%d/%m/%Y"))
+)
+pl$Date <- as.Date(pl$Date)
+
+# Sort
+pl <- pl %>%
+  arrange(Date)
+
+# Save — overwrites the old pl_clean.rds with all bookmaker columns included
+saveRDS(pl, "pl_clean.rds")
+```
+
+
+
+
+
+```{r}
+# ═══════════════════════════════════════════════════════════════
+# BOOKMAKER ANALYSIS
+# Option 1 — Multiple bookmaker comparison
+# Option 2 — Favourite-longshot bias
+# Option 3 — Residual correlation with match statistics
+#
+# Data source: pl_clean.rds
+# Requires: log_loss and brier_score functions (defined below)
+# ═══════════════════════════════════════════════════════════════
+
+library(tidyverse)
+library(zoo)
+library(purrr)
+
+select <- dplyr::select
+filter <- dplyr::filter
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 1: LOAD DATA
+# ═══════════════════════════════════════════════════════════════
+
+pl <- readRDS("pl_clean.rds")
+
+team_map <- c(
+  "Man City"      = "Manchester City",
+  "Man United"    = "Manchester United",
+  "Newcastle"     = "Newcastle United",
+  "Nott'm Forest" = "Nottingham Forest",
+  "West Brom"     = "West Bromwich Albion",
+  "Wolves"        = "Wolverhampton Wanderers"
+)
+
+pl <- pl %>%
+  mutate(
+    HomeTeam = recode(HomeTeam, !!!team_map),
+    AwayTeam = recode(AwayTeam, !!!team_map),
+    Date     = as.Date(Date),
+    home_win = as.integer(FTR == "H")
+  )
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 2: EVALUATION FUNCTIONS
+# ═══════════════════════════════════════════════════════════════
+
+log_loss <- function(actual, predicted) {
+  p <- pmax(pmin(predicted, 1 - 1e-15), 1e-15)
+  -mean(actual * log(p) + (1 - actual) * log(1 - p))
+}
+
+brier_score <- function(actual, predicted) {
+  mean((actual - predicted)^2)
+}
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 3: COMPUTE FAIR PROBABILITIES FOR ALL BOOKMAKERS
+# Overround removed for each bookmaker separately
+# ═══════════════════════════════════════════════════════════════
+
+bookmakers <- list(
+  B365 = c("B365H", "B365D", "B365A"),
+  BW   = c("BWH",   "BWD",   "BWA"),
+  IW   = c("IWH",   "IWD",   "IWA"),
+  LB   = c("LBH",   "LBD",   "LBA"),
+  PS   = c("PSH",   "PSD",   "PSA"),
+  WH   = c("WHH",   "WHD",   "WHA"),
+  VC   = c("VCH",   "VCD",   "VCA"),
+  BbMx = c("BbMxH", "BbMxD", "BbMxA"),
+  BbAv = c("BbAvH", "BbAvD", "BbAvA")
+)
+
+for (bm in names(bookmakers)) {
+  cols <- bookmakers[[bm]]
+  pl <- pl %>%
+    mutate(
+      impl_h    = 1 / .data[[cols[1]]],
+      impl_d    = 1 / .data[[cols[2]]],
+      impl_a    = 1 / .data[[cols[3]]],
+      overround = impl_h + impl_d + impl_a,
+      !!paste0("p_home_", bm) := impl_h / overround
+    ) %>%
+    select(-impl_h, -impl_d, -impl_a, -overround)
+}
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 4: TRAIN / TEST SPLIT
+# ═══════════════════════════════════════════════════════════════
+
+train_bm <- pl %>% filter(Date <  as.Date("2023-08-01"))
+test_bm  <- pl %>% filter(Date >= as.Date("2023-08-01"))
+
+# ═══════════════════════════════════════════════════════════════
+# OPTION 1 — MULTIPLE BOOKMAKER COMPARISON
+# Fits a logistic model for each bookmaker using only their
+# fair home win probability as predictor, evaluates on test set
+# ═══════════════════════════════════════════════════════════════
+
+bm_results <- map_dfr(names(bookmakers), function(bm) {
+  col <- paste0("p_home_", bm)
+
+  train_clean <- train_bm %>% filter(!is.na(.data[[col]]))
+  test_clean  <- test_bm  %>% filter(!is.na(.data[[col]]))
+
+  # Skip if not enough data in train or test
+  if (nrow(train_clean) < 10 || nrow(test_clean) < 10) {
+    cat("Skipping", bm, "— insufficient data\n")
+    return(NULL)
+  }
+
+  train_tmp <- train_clean %>% rename(p_bm = all_of(col))
+  test_tmp  <- test_clean  %>% rename(p_bm = all_of(col))
+
+  model <- glm(
+    home_win ~ p_bm,
+    data   = train_tmp,
+    family = binomial(link = "logit")
+  )
+
+  preds <- predict(model, newdata = test_tmp, type = "response")
+
+  tibble(
+    bookmaker  = bm,
+    log_loss   = round(log_loss(test_clean$home_win, preds),    4),
+    brier      = round(brier_score(test_clean$home_win, preds), 4),
+    avg_p_home = round(mean(test_clean[[col]], na.rm = TRUE),   4),
+    avg_margin = round(mean(
+      1 / test_clean[[bookmakers[[bm]][1]]] +
+      1 / test_clean[[bookmakers[[bm]][2]]] +
+      1 / test_clean[[bookmakers[[bm]][3]]] - 1,
+      na.rm = TRUE
+    ), 4)
+  )
+})
+
+cat("=== Option 1: Bookmaker comparison ===\n")
+print(bm_results)
+
+# ═══════════════════════════════════════════════════════════════
+# OPTION 2 — FAVOURITE-LONGSHOT BIAS
+# Splits matches into probability buckets and compares implied
+# probability against actual home win rate in each bucket
+# bias = actual_rate - avg_implied
+# Positive bias in high-p buckets = favourites underpriced
+# Negative bias in low-p buckets  = longshots overpriced
+# ═══════════════════════════════════════════════════════════════
+
+# 2a — Pinnacle only (sharpest market)
+bias_pinnacle <- test_bm %>%
+  filter(!is.na(p_home_PS)) %>%
+  mutate(
+    p_bucket = cut(p_home_PS,
+                   breaks = seq(0, 1, by = 0.1),
+                   include.lowest = TRUE)
+  ) %>%
+  group_by(p_bucket) %>%
+  summarise(
+    n           = n(),
+    avg_implied = round(mean(p_home_PS), 4),
+    actual_rate = round(mean(home_win),  4),
+    bias        = round(mean(home_win) - mean(p_home_PS), 4),
+    .groups = "drop"
+  )
+
+cat("\n=== Option 2a: Favourite-longshot bias — Pinnacle ===\n")
+print(bias_pinnacle)
+
+# 2b — Overall bias summary across all bookmakers
+bias_summary <- map_dfr(names(bookmakers), function(bm) {
+  col <- paste0("p_home_", bm)
+  test_bm %>%
+    filter(!is.na(.data[[col]])) %>%
+    summarise(
+      bookmaker    = bm,
+      avg_implied  = round(mean(.data[[col]]),                  4),
+      actual_rate  = round(mean(home_win),                      4),
+      overall_bias = round(mean(home_win) - mean(.data[[col]]), 4)
+    )
+})
+
+cat("\n=== Option 2b: Overall bias summary per bookmaker ===\n")
+print(bias_summary)
+
+# 2c — Bias by probability bucket across all bookmakers
+bias_by_bm <- map_dfr(names(bookmakers), function(bm) {
+  col <- paste0("p_home_", bm)
+  test_bm %>%
+    filter(!is.na(.data[[col]])) %>%
+    mutate(
+      p_bucket = cut(.data[[col]],
+                     breaks = seq(0, 1, by = 0.1),
+                     include.lowest = TRUE)
+    ) %>%
+    group_by(p_bucket) %>%
+    summarise(
+      bookmaker   = bm,
+      n           = n(),
+      avg_implied = round(mean(.data[[col]]), 4),
+      actual_rate = round(mean(home_win),     4),
+      bias        = round(mean(home_win) - mean(.data[[col]]), 4),
+      .groups = "drop"
+    )
+})
+
+cat("\n=== Option 2c: Bias by bucket across all bookmakers ===\n")
+print(bias_by_bm)
+
+# ═══════════════════════════════════════════════════════════════
+# OPTION 3 — RESIDUAL CORRELATION WITH MATCH STATISTICS
+# Pearson residuals from the bookmaker baseline correlated with
+# rolling match stats to find what the bookmaker misses
+# ═══════════════════════════════════════════════════════════════
+
+# 3a — Compute rolling 5-game averages of match stats
+# Home team stats grouped by HomeTeam
+home_stat_cols <- c("HS", "HST", "HC", "HF", "HY", "HR")
+away_stat_cols <- c("AS", "AST", "AC", "AF", "AY", "AR")
+
+for (col in home_stat_cols) {
+  pl <- pl %>%
+    group_by(HomeTeam) %>%
+    arrange(Date, .by_group = TRUE) %>%
+    mutate(
+      !!paste0("home_", col, "_avg") :=
+        lag(rollmean(.data[[col]], 5, fill = NA, align = "right"))
+    ) %>%
+    ungroup()
+}
+
+for (col in away_stat_cols) {
+  pl <- pl %>%
+    group_by(AwayTeam) %>%
+    arrange(Date, .by_group = TRUE) %>%
+    mutate(
+      !!paste0("away_", col, "_avg") :=
+        lag(rollmean(.data[[col]], 5, fill = NA, align = "right"))
+    ) %>%
+    ungroup()
+}
+
+# 3b — Re-split after adding rolling features
+train_resid <- pl %>%
+  filter(Date <  as.Date("2023-08-01"), !is.na(p_home_B365))
+test_resid  <- pl %>%
+  filter(Date >= as.Date("2023-08-01"), !is.na(p_home_B365))
+
+# 3c — Fit bookmaker baseline and extract Pearson residuals
+logit_book <- glm(
+  home_win ~ p_home_B365,
+  data   = train_resid,
+  family = binomial(link = "logit")
+)
+
+train_resid <- train_resid %>%
+  mutate(pearson_resid = residuals(logit_book, type = "pearson"))
+
+# 3d — Correlate Pearson residuals with rolling match stats
+rolling_cols <- c(
+  paste0("home_", home_stat_cols, "_avg"),
+  paste0("away_", away_stat_cols, "_avg")
+)
+
+cor_results <- map_dfr(rolling_cols, function(col) {
+  ct <- cor.test(
+    train_resid$pearson_resid,
+    train_resid[[col]],
+    use = "complete.obs"
+  )
+  tibble(
+    variable    = col,
+    correlation = round(ct$estimate, 4),
+    p_value     = round(ct$p.value,  4),
+    significant = ct$p.value < 0.05
+  )
+}) %>%
+  arrange(desc(abs(correlation)))
+
+cat("\n=== Option 3: Residual correlations with match statistics ===\n")
+print(cor_results)
+
+# 3e — Fit extended model with significant variables
+sig_vars <- cor_results %>%
+  filter(significant == TRUE) %>%
+  pull(variable)
+
+cat("\nSignificant variables to add to model:\n")
+print(sig_vars)
+
+if (length(sig_vars) > 0) {
+
+  formula_extended <- as.formula(
+    paste("home_win ~ p_home_B365 +", paste(sig_vars, collapse = " + "))
+  )
+
+  train_extended <- train_resid %>%
+    filter(complete.cases(across(all_of(sig_vars))))
+
+  logit_extended <- glm(
+    formula_extended,
+    data   = train_extended,
+    family = binomial(link = "logit")
+  )
+
+  summary(logit_extended)
+
+  test_extended <- test_resid %>%
+    filter(complete.cases(across(all_of(sig_vars))))
+
+  preds_extended <- predict(logit_extended,
+                            newdata = test_extended,
+                            type    = "response")
+
+  cat("\n=== Extended model vs bookmaker baseline ===\n")
+  cat("Bookmaker log loss: ",
+      round(log_loss(test_extended$home_win,
+                     test_extended$p_home_B365), 4), "\n")
+  cat("Extended log loss:  ",
+      round(log_loss(test_extended$home_win,
+                     preds_extended), 4), "\n")
+  cat("Bookmaker Brier:    ",
+      round(brier_score(test_extended$home_win,
+                        test_extended$p_home_B365), 4), "\n")
+  cat("Extended Brier:     ",
+      round(brier_score(test_extended$home_win,
+                        preds_extended), 4), "\n")
+
+} else {
+  cat("No significant variables found — bookmaker appears efficient\n")
+}
+
+# ── Option 3b: Residual correlation with xG features ───────────
+
+match_xg <- readRDS("epl_match_xg.rds")
+
+# Reshape to team level and compute rolling xG averages
+model_df_bm <- bind_rows(
+  match_xg %>% transmute(
+    match_id, date = as.Date(date),
+    team      = home_team,
+    opponent  = away_team,
+    home_away = "home",
+    xG_openplay = home_xG_openplay,
+    xG_corner   = home_xG_corner,
+    xG_freekick = home_xG_freekick,
+    xG_penalty  = home_xG_penalty,
+    xG_setpiece = home_xG_setpiece
+  ),
+  match_xg %>% transmute(
+    match_id, date = as.Date(date),
+    team      = away_team,
+    opponent  = home_team,
+    home_away = "away",
+    xG_openplay = away_xG_openplay,
+    xG_corner   = away_xG_corner,
+    xG_freekick = away_xG_freekick,
+    xG_penalty  = away_xG_penalty,
+    xG_setpiece = away_xG_setpiece
+  )
+) %>%
+  arrange(team, date) %>%
+  group_by(team) %>%
+  mutate(
+    roll_xG_openplay = lag(rollmean(xG_openplay, 5, fill = NA, align = "right"), 1),
+    roll_xG_corner   = lag(rollmean(xG_corner,   5, fill = NA, align = "right"), 1),
+    roll_xG_freekick = lag(rollmean(xG_freekick, 5, fill = NA, align = "right"), 1),
+    roll_xG_penalty  = lag(rollmean(xG_penalty,  5, fill = NA, align = "right"), 1),
+    roll_xG_setpiece = lag(rollmean(xG_setpiece, 5, fill = NA, align = "right"), 1)
+  ) %>%
+  ungroup()
+
+# Collapse to match level
+home_xg <- model_df_bm %>%
+  filter(home_away == "home") %>%
+  select(match_id, date,
+         home_team        = team,
+         away_team        = opponent,
+         home_roll_xG_openplay = roll_xG_openplay,
+         home_roll_xG_corner   = roll_xG_corner,
+         home_roll_xG_freekick = roll_xG_freekick,
+         home_roll_xG_penalty  = roll_xG_penalty,
+         home_roll_xG_setpiece = roll_xG_setpiece)
+
+away_xg <- model_df_bm %>%
+  filter(home_away == "away") %>%
+  select(match_id,
+         away_roll_xG_openplay = roll_xG_openplay,
+         away_roll_xG_corner   = roll_xG_corner,
+         away_roll_xG_freekick = roll_xG_freekick,
+         away_roll_xG_penalty  = roll_xG_penalty,
+         away_roll_xG_setpiece = roll_xG_setpiece)
+
+xg_match <- home_xg %>%
+  left_join(away_xg, by = "match_id")
+
+# Join xG features onto the training residuals data
+train_resid_xg <- train_resid %>%
+  left_join(
+    xg_match,
+    by = c("Date" = "date",
+           "HomeTeam" = "home_team",
+           "AwayTeam" = "away_team")
+  )
+
+# Correlate Pearson residuals with rolling xG features
+xg_cols <- c(
+  "home_roll_xG_openplay", "home_roll_xG_corner",
+  "home_roll_xG_freekick", "home_roll_xG_penalty",
+  "home_roll_xG_setpiece", "away_roll_xG_openplay",
+  "away_roll_xG_corner",   "away_roll_xG_freekick",
+  "away_roll_xG_penalty",  "away_roll_xG_setpiece"
+)
+
+cor_results_xg <- map_dfr(xg_cols, function(col) {
+  ct <- cor.test(
+    train_resid_xg$pearson_resid,
+    train_resid_xg[[col]],
+    use = "complete.obs"
+  )
+  tibble(
+    variable    = col,
+    correlation = round(ct$estimate, 4),
+    p_value     = round(ct$p.value,  4),
+    significant = ct$p.value < 0.05
+  )
+}) %>%
+  arrange(desc(abs(correlation)))
+
+cat("\n=== Option 3b: Residual correlations — xG features ===\n")
+print(cor_results_xg)
+```
+
