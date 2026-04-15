@@ -1,0 +1,567 @@
+---
+title: "residual chat"
+output: html_document
+date: "2026-04-15"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Load packages
+```{r}
+library(readr)
+library(dplyr)
+library(purrr)
+library(stringr)
+library(zoo)
+library(tidyr)
+library(lubridate)
+```
+
+Helper functions
+```{r}
+log_loss <- function(actual, p) {
+  keep <- !is.na(actual) & !is.na(p)
+  actual <- actual[keep]
+  p <- p[keep]
+  p <- pmin(pmax(p, 1e-15), 1 - 1e-15)
+  -mean(actual * log(p) + (1 - actual) * log(1 - p))
+}
+
+brier_score <- function(actual, p) {
+  keep <- !is.na(actual) & !is.na(p)
+  actual <- actual[keep]
+  p <- p[keep]
+  mean((actual - p)^2)
+}
+
+clip_prob <- function(p) {
+  pmin(pmax(p, 1e-6), 1 - 1e-6)
+}
+```
+
+Load Football-Data files
+```{r}
+files <- c(
+  "PL 16-17.csv",
+  "PL 17-18.csv",
+  "PL 18-19.csv",
+  "PL 19-20.csv",
+  "PL 20-21.csv",
+  "PL 21-22.csv",
+  "PL 22-23.csv",
+  "PL 23-24.csv",
+  "PL 24-25.csv"
+)
+
+pl_raw <- map_dfr(files, function(file) {
+  read_csv(
+    file,
+    col_types = cols(Date = col_character()),
+    show_col_types = FALSE
+  ) %>%
+    mutate(season = str_remove(file, "\\.csv$"))
+})
+```
+
+Select variables and clean data
+```{r}
+bookmakers <- c("B365", "BW", "IW", "PS", "WH", "VC")
+
+book_cols <- c(
+  unlist(lapply(bookmakers, function(b) paste0(b, c("H", "D", "A"))))
+)
+
+base_cols <- c("Date", "HomeTeam", "AwayTeam", "FTHG", "FTAG", "FTR", "season")
+
+pl <- pl_raw %>%
+  select(any_of(c(base_cols, book_cols))) %>%
+  mutate(Date = trimws(Date))
+
+pl$Date <- ifelse(
+  nchar(pl$Date) == 8,
+  as.character(as.Date(pl$Date, format = "%d/%m/%y")),
+  as.character(as.Date(pl$Date, format = "%d/%m/%Y"))
+)
+
+pl$Date <- as.Date(pl$Date)
+
+pl <- pl %>%
+  arrange(Date) %>%
+  mutate(
+    match_result = case_when(
+      FTR == "H" ~ "HomeWin",
+      FTR == "D" ~ "Draw",
+      FTR == "A" ~ "AwayWin",
+      TRUE ~ NA_character_
+    ),
+    total_goals = FTHG + FTAG,
+    over_2_5 = ifelse(total_goals > 2.5, 1, 0),
+    home_win = ifelse(FTR == "H", 1, 0)
+  ) %>%
+  filter(
+    !is.na(Date),
+    !is.na(HomeTeam),
+    !is.na(AwayTeam),
+    !is.na(FTHG),
+    !is.na(FTAG),
+    !is.na(FTR)
+  )
+```
+
+Convert odds to implied probabilities
+```{r}
+make_probs <- function(df, prefix) {
+  h_col <- paste0(prefix, "H")
+  d_col <- paste0(prefix, "D")
+  a_col <- paste0(prefix, "A")
+
+  if (!all(c(h_col, d_col, a_col) %in% names(df))) {
+    return(df)
+  }
+
+  p_home_raw <- 1 / df[[h_col]]
+  p_draw_raw <- 1 / df[[d_col]]
+  p_away_raw <- 1 / df[[a_col]]
+
+  prob_sum <- p_home_raw + p_draw_raw + p_away_raw
+
+  df[[paste0("p_home_", prefix)]] <- p_home_raw / prob_sum
+  df[[paste0("p_draw_", prefix)]] <- p_draw_raw / prob_sum
+  df[[paste0("p_away_", prefix)]] <- p_away_raw / prob_sum
+
+  df
+}
+
+for (b in bookmakers) {
+  pl <- make_probs(pl, b)
+}
+
+available_books <- bookmakers[
+  sapply(bookmakers, function(b) paste0("p_home_", b) %in% names(pl))
+]
+
+available_books
+```
+
+Build market forecast variables
+```{r}
+home_prob_cols <- paste0("p_home_", available_books)
+draw_prob_cols <- paste0("p_draw_", available_books)
+away_prob_cols <- paste0("p_away_", available_books)
+
+pl <- pl %>%
+  mutate(
+    p_home_market = rowMeans(across(all_of(home_prob_cols)), na.rm = TRUE),
+    p_draw_market = rowMeans(across(all_of(draw_prob_cols)), na.rm = TRUE),
+    p_away_market = rowMeans(across(all_of(away_prob_cols)), na.rm = TRUE),
+
+    p_home_sd = apply(select(., all_of(home_prob_cols)), 1, sd, na.rm = TRUE),
+    p_home_min = apply(select(., all_of(home_prob_cols)), 1, min, na.rm = TRUE),
+    p_home_max = apply(select(., all_of(home_prob_cols)), 1, max, na.rm = TRUE)
+  )
+```
+
+Keeping Bet365 as benchmark
+```{r}
+pl <- pl %>%
+  mutate(
+    p_home_b365 = if ("p_home_B365" %in% names(.)) p_home_B365 else NA_real_
+  )
+```
+
+Merge xg data
+```{r}
+match_xg <- readRDS("epl_match_xg.rds")
+
+team_map <- c(
+  "Man City" = "Manchester City",
+  "Man United" = "Manchester United",
+  "Newcastle" = "Newcastle United",
+  "Nott'm Forest" = "Nottingham Forest",
+  "West Brom" = "West Bromwich Albion",
+  "Wolves" = "Wolverhampton Wanderers"
+)
+
+pl <- pl %>%
+  mutate(
+    HomeTeam = recode(HomeTeam, !!!team_map),
+    AwayTeam = recode(AwayTeam, !!!team_map)
+  )
+
+match_xg <- match_xg %>%
+  mutate(date = as.Date(date))
+
+match_xg_small <- match_xg %>%
+  select(
+    date, season, home_team, away_team,
+    home_xG, away_xG
+  )
+
+pl_xg <- pl %>%
+  left_join(
+    match_xg_small,
+    by = c(
+      "Date" = "date",
+      "HomeTeam" = "home_team",
+      "AwayTeam" = "away_team"
+    )
+  ) %>%
+  mutate(
+    xG_diff = home_xG - away_xG
+  )
+```
+
+Rolling features
+```{r}
+pl_xg <- pl_xg %>%
+  group_by(HomeTeam) %>%
+  arrange(Date, .by_group = TRUE) %>%
+  mutate(
+    home_xG_avg_5 = lag(rollapply(home_xG, 5, mean, fill = NA, align = "right"))
+  ) %>%
+  ungroup()
+
+pl_xg <- pl_xg %>%
+  group_by(AwayTeam) %>%
+  arrange(Date, .by_group = TRUE) %>%
+  mutate(
+    away_xG_avg_5 = lag(rollapply(away_xG, 5, mean, fill = NA, align = "right"))
+  ) %>%
+  ungroup() %>%
+  mutate(
+    xG_diff_avg_5 = home_xG_avg_5 - away_xG_avg_5,
+    xG_diff_avg_5_sq = xG_diff_avg_5^2
+  )
+```
+
+Train/test split
+```{r}
+train <- pl_xg %>%
+  filter(Date < as.Date("2023-08-01"))
+
+test <- pl_xg %>%
+  filter(Date >= as.Date("2023-08-01"))
+```
+
+MODEL 1: Bet365 raw
+```{r}
+test <- test %>%
+  mutate(pred_b365 = p_home_b365)
+```
+
+MODEL 2: Market average raw
+```{r}
+test <- test %>%
+  mutate(pred_market_raw = p_home_market)
+```
+
+MODEL 3: Market recalibration
+```{r}
+model_recal <- glm(
+  home_win ~ p_home_market,
+  data = train,
+  family = binomial
+)
+
+test <- test %>%
+  mutate(
+    pred_market_recal = predict(model_recal, newdata = ., type = "response")
+  )
+```
+
+MODEL 4: Residual correction with xg
+```{r}
+train <- train %>%
+  mutate(error_market = home_win - p_home_market)
+
+model_error_xg <- lm(
+  error_market ~ xG_diff_avg_5,
+  data = train %>% filter(!is.na(xG_diff_avg_5), !is.na(p_home_market))
+)
+
+test <- test %>%
+  mutate(
+    error_hat_xg = predict(model_error_xg, newdata = .),
+    pred_corrected_xg = clip_prob(p_home_market + error_hat_xg)
+  )
+```
+
+MODEL 5: Residual correction with xg+nonlinearity
+```{r}
+model_error_xg_nl <- lm(
+  error_market ~ xG_diff_avg_5 + I(xG_diff_avg_5^2),
+  data = train %>% filter(!is.na(xG_diff_avg_5), !is.na(p_home_market))
+)
+
+test <- test %>%
+  mutate(
+    error_hat_xg_nl = predict(model_error_xg_nl, newdata = .),
+    pred_corrected_xg_nl = clip_prob(p_home_market + error_hat_xg_nl)
+  )
+```
+
+MODEL 6: Residual correction with xg+nonlinearity+dispersion
+```{r}
+model_error_full <- lm(
+  error_market ~ xG_diff_avg_5 + I(xG_diff_avg_5^2) + p_home_sd,
+  data = train %>%
+    filter(!is.na(xG_diff_avg_5), !is.na(p_home_market), !is.na(p_home_sd))
+)
+
+test <- test %>%
+  mutate(
+    error_hat_full = predict(model_error_full, newdata = .),
+    pred_corrected_full = clip_prob(p_home_market + error_hat_full)
+  )
+```
+
+MODEL 7: Direct logit robustness model
+```{r}
+model_direct <- glm(
+  home_win ~ p_home_market + xG_diff_avg_5 + I(xG_diff_avg_5^2) + p_home_sd,
+  data = train %>%
+    filter(!is.na(xG_diff_avg_5), !is.na(p_home_market), !is.na(p_home_sd)),
+  family = binomial
+)
+
+test <- test %>%
+  mutate(
+    pred_direct = predict(model_direct, newdata = ., type = "response")
+  )
+```
+
+Evaluating models
+```{r}
+results_table <- tibble(
+  model = c(
+    "Bet365 raw",
+    "Market average raw",
+    "Market recalibration",
+    "Residual correction: xG",
+    "Residual correction: xG + nonlinearity",
+    "Residual correction: xG + nonlinearity + dispersion",
+    "Direct logit robustness"
+  ),
+  log_loss = c(
+    log_loss(test$home_win, test$pred_b365),
+    log_loss(test$home_win, test$pred_market_raw),
+    log_loss(test$home_win, test$pred_market_recal),
+    log_loss(test$home_win, test$pred_corrected_xg),
+    log_loss(test$home_win, test$pred_corrected_xg_nl),
+    log_loss(test$home_win, test$pred_corrected_full),
+    log_loss(test$home_win, test$pred_direct)
+  ),
+  brier = c(
+    brier_score(test$home_win, test$pred_b365),
+    brier_score(test$home_win, test$pred_market_raw),
+    brier_score(test$home_win, test$pred_market_recal),
+    brier_score(test$home_win, test$pred_corrected_xg),
+    brier_score(test$home_win, test$pred_corrected_xg_nl),
+    brier_score(test$home_win, test$pred_corrected_full),
+    brier_score(test$home_win, test$pred_direct)
+  )
+)
+
+results_table
+```
+
+EXTRA: Testing if market is biased
+
+Calibration
+```{r}
+calibration_market <- test %>%
+  mutate(
+    prob_bucket = cut(
+      pred_market_raw,
+      breaks = seq(0, 1, by = 0.1),
+      include.lowest = TRUE
+    )
+  ) %>%
+  group_by(prob_bucket) %>%
+  summarise(
+    n = n(),
+    avg_pred = mean(pred_market_raw, na.rm = TRUE),
+    actual_home_win = mean(home_win, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+calibration_market
+```
+Residual diagnostics
+```{r}
+summary(model_error_xg)
+summary(model_error_xg_nl)
+summary(model_error_full)
+```
+
+ADVANCED MODELS
+
+Interaction model
+```{r}
+model_error_interact <- lm(
+  error_market ~ xG_diff_avg_5 * p_home_market + p_home_sd,
+  data = train %>%
+    filter(!is.na(xG_diff_avg_5), !is.na(p_home_market), !is.na(p_home_sd))
+)
+
+test <- test %>%
+  mutate(
+    error_hat_interact = predict(model_error_interact, newdata = .),
+    pred_corrected_interact = clip_prob(p_home_market + error_hat_interact)
+  )
+```
+
+Interaction+nonlinearity
+```{r}
+model_error_interact_nl <- lm(
+  error_market ~ xG_diff_avg_5 * p_home_market +
+                 I(xG_diff_avg_5^2) * p_home_market +
+                 p_home_sd,
+  data = train %>%
+    filter(!is.na(xG_diff_avg_5), !is.na(p_home_market), !is.na(p_home_sd))
+)
+
+test <- test %>%
+  mutate(
+    error_hat_interact_nl = predict(model_error_interact_nl, newdata = .),
+    pred_corrected_interact_nl = clip_prob(p_home_market + error_hat_interact_nl)
+  )
+```
+
+"Disagreement" instead of sd
+```{r}
+train <- train %>%
+  mutate(
+    disagreement = p_home_max - p_home_min
+  )
+
+test <- test %>%
+  mutate(
+    disagreement = p_home_max - p_home_min
+  )
+
+model_error_disagree <- lm(
+  error_market ~ xG_diff_avg_5 * p_home_market +
+                 I(xG_diff_avg_5^2) +
+                 disagreement,
+  data = train %>%
+    filter(!is.na(xG_diff_avg_5), !is.na(disagreement))
+)
+
+test <- test %>%
+  mutate(
+    error_hat_disagree = predict(model_error_disagree, newdata = .),
+    pred_corrected_disagree = clip_prob(p_home_market + error_hat_disagree)
+  )
+```
+
+Segmented model
+```{r}
+train_mid <- train %>%
+  filter(p_home_market > 0.3 & p_home_market < 0.7)
+
+train_extreme <- train %>%
+  filter(p_home_market <= 0.3 | p_home_market >= 0.7)
+
+model_mid <- lm(
+  error_market ~ xG_diff_avg_5 + I(xG_diff_avg_5^2),
+  data = train_mid
+)
+
+model_extreme <- lm(
+  error_market ~ xG_diff_avg_5 + I(xG_diff_avg_5^2),
+  data = train_extreme
+)
+
+test <- test %>%
+  mutate(
+    error_hat_segment = ifelse(
+      p_home_market > 0.3 & p_home_market < 0.7,
+      predict(model_mid, newdata = .),
+      predict(model_extreme, newdata = .)
+    ),
+    pred_corrected_segment = clip_prob(p_home_market + error_hat_segment)
+  )
+```
+
+Logit transformation
+```{r}
+logit <- function(p) log(p / (1 - p))
+inv_logit <- function(x) exp(x) / (1 + exp(x))
+
+train <- train %>%
+  mutate(
+    logit_p = logit(p_home_market)
+  )
+
+test <- test %>%
+  mutate(
+    logit_p = logit(p_home_market)
+  )
+
+model_logit_adj <- lm(
+  home_win ~ logit_p + xG_diff_avg_5 + I(xG_diff_avg_5^2) + p_home_sd,
+  data = train %>%
+    filter(!is.na(xG_diff_avg_5), !is.na(p_home_sd))
+)
+
+test <- test %>%
+  mutate(
+    pred_logit_adj = clip_prob(predict(model_logit_adj, newdata = .))
+  )
+```
+
+Updated evaluation table
+```{r}
+results_table_extended <- tibble(
+  model = c(
+    "Bet365 raw",
+    "Market average raw",
+    "Market recalibration",
+    "Residual correction full",
+    "Interaction model",
+    "Interaction + nonlinear",
+    "Disagreement model",
+    "Segmented model",
+    "Logit adjusted model"
+  ),
+  log_loss = c(
+    log_loss(test$home_win, test$pred_b365),
+    log_loss(test$home_win, test$pred_market_raw),
+    log_loss(test$home_win, test$pred_market_recal),
+    log_loss(test$home_win, test$pred_corrected_full),
+    log_loss(test$home_win, test$pred_corrected_interact),
+    log_loss(test$home_win, test$pred_corrected_interact_nl),
+    log_loss(test$home_win, test$pred_corrected_disagree),
+    log_loss(test$home_win, test$pred_corrected_segment),
+    log_loss(test$home_win, test$pred_logit_adj)
+  ),
+  brier = c(
+    brier_score(test$home_win, test$pred_b365),
+    brier_score(test$home_win, test$pred_market_raw),
+    brier_score(test$home_win, test$pred_market_recal),
+    brier_score(test$home_win, test$pred_corrected_full),
+    brier_score(test$home_win, test$pred_corrected_interact),
+    brier_score(test$home_win, test$pred_corrected_interact_nl),
+    brier_score(test$home_win, test$pred_corrected_disagree),
+    brier_score(test$home_win, test$pred_corrected_segment),
+    brier_score(test$home_win, test$pred_logit_adj)
+  )
+)
+
+results_table_extended
+```
+
+Test variance og mean i market error
+```{r}
+test <- test %>%
+  mutate(
+    error_market = home_win - p_home_market
+  )
+var(test$error_market)
+mean(abs(test$error_market))
+```
+
+
