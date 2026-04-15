@@ -90,10 +90,10 @@ add_profit <- function(df) {
 Load data
 ```{r}
 pl <- readRDS("pl_clean.rds")
-team_match_df <- readRDS("epl_team_match_df.rds")
+team_match_df <- readRDS("pl_team_match_df.rds")
 ```
 
-Align team names and clean bookmaker data
+Team name mapping and clean bookmaker data
 ```{r}
 team_map <- c(
   "Man City" = "Manchester City",

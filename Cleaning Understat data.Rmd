@@ -130,19 +130,25 @@ create_team_match_df <- function(league_name) {
   team_match_df
 }
 
+pl_team_match_df <- create_team_match_df("EPL")
 ll_team_match_df <- create_team_match_df("La liga")
 sa_team_match_df <- create_team_match_df("Serie A")
 bl_team_match_df <- create_team_match_df("Bundesliga")
 
+saveRDS(pl_team_match_df, "pl_team_match_df.rds")
 saveRDS(ll_team_match_df, "ll_team_match_df.rds")
 saveRDS(sa_team_match_df, "sa_team_match_df.rds")
 saveRDS(bl_team_match_df, "bl_team_match_df.rds")
 
+nrow(pl_team_match_df)
 nrow(ll_team_match_df)
 nrow(sa_team_match_df)
 nrow(bl_team_match_df)
 
+names(pl_team_match_df)
 names(ll_team_match_df)
+names(sa_team_match_df)
+names(bl_team_match_df)
 ```
 
 

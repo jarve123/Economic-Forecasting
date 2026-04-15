@@ -1,0 +1,173 @@
+---
+title: "Clean files"
+output: html_document
+date: "2026-04-15"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(readr)
+library(dplyr)
+library(purrr)
+library(stringr)
+
+parse_date_safe <- function(x) {
+  x1 <- as.Date(x, format = "%d/%m/%Y")
+  x2 <- as.Date(x, format = "%d/%m/%y")
+  x3 <- as.Date(x, format = "%Y-%m-%d")
+  x4 <- as.Date(x, format = "%Y/%m/%d")
+  
+  out <- x1
+  out[is.na(out)] <- x2[is.na(out)]
+  out[is.na(out)] <- x3[is.na(out)]
+  out[is.na(out)] <- x4[is.na(out)]
+  
+  out
+}
+
+check_required_columns <- function(df, league_name) {
+  required_cols <- c(
+    "Date", "HomeTeam", "AwayTeam",
+    "FTHG", "FTAG", "FTR",
+    "B365H", "B365D", "B365A"
+  )
+  
+  missing_cols <- setdiff(required_cols, names(df))
+  
+  if (length(missing_cols) > 0) {
+    stop(
+      paste0(
+        league_name,
+        ": missing required columns: ",
+        paste(missing_cols, collapse = ", ")
+      )
+    )
+  }
+}
+
+load_odds_files <- function(folder, prefix) {
+  files <- file.path(
+    folder,
+    c(
+      paste0(prefix, " 16-17.csv"),
+      paste0(prefix, " 17-18.csv"),
+      paste0(prefix, " 18-19.csv"),
+      paste0(prefix, " 19-20.csv"),
+      paste0(prefix, " 20-21.csv"),
+      paste0(prefix, " 21-22.csv"),
+      paste0(prefix, " 22-23.csv"),
+      paste0(prefix, " 23-24.csv"),
+      paste0(prefix, " 24-25.csv")
+    )
+  )
+  
+  missing_files <- files[!file.exists(files)]
+  
+  if (length(missing_files) > 0) {
+    stop(
+      paste0(
+        "Missing files:\n",
+        paste(missing_files, collapse = "\n")
+      )
+    )
+  }
+  
+  map_dfr(files, function(file) {
+    read_csv(
+      file,
+      col_types = cols(Date = col_character()),
+      show_col_types = FALSE
+    ) %>%
+      mutate(
+        season = str_remove(basename(file), "\\.csv$")
+      )
+  })
+}
+
+make_clean_file <- function(folder, prefix, output_file, league_name) {
+  raw_df <- load_odds_files(folder, prefix)
+  
+  check_required_columns(raw_df, league_name)
+  
+  clean_df <- raw_df %>%
+    transmute(
+      season = season,
+      Date = parse_date_safe(Date),
+      HomeTeam = str_trim(HomeTeam),
+      AwayTeam = str_trim(AwayTeam),
+      FTHG = as.numeric(FTHG),
+      FTAG = as.numeric(FTAG),
+      FTR = FTR,
+      B365H = as.numeric(B365H),
+      B365D = as.numeric(B365D),
+      B365A = as.numeric(B365A)
+    )
+  
+  if (any(is.na(clean_df$Date))) {
+    bad_rows <- clean_df %>%
+      filter(is.na(Date))
+    
+    cat("\n", league_name, ": rows with unparsed dates:\n", sep = "")
+    print(bad_rows)
+    stop(paste0(league_name, ": some dates could not be parsed."))
+  }
+  
+  saveRDS(clean_df, output_file)
+  
+  cat("\nSaved ", output_file, " successfully.\n", sep = "")
+  cat("Rows: ", nrow(clean_df), "\n", sep = "")
+  cat("Seasons: ", paste(sort(unique(clean_df$season)), collapse = ", "), "\n", sep = "")
+}
+```
+
+Create all 4 clean files
+```{r}
+make_clean_file(
+  folder = "PL",
+  prefix = "PL",
+  output_file = "pl_clean.rds",
+  league_name = "Premier League"
+)
+
+make_clean_file(
+  folder = "LL",
+  prefix = "LL",
+  output_file = "ll_clean.rds",
+  league_name = "La Liga"
+)
+
+make_clean_file(
+  folder = "SA",
+  prefix = "SA",
+  output_file = "sa_clean.rds",
+  league_name = "Serie A"
+)
+
+make_clean_file(
+  folder = "BL",
+  prefix = "BL",
+  output_file = "bl_clean.rds",
+  league_name = "Bundesliga"
+)
+```
+Checks for each league
+```{r}
+pl <- readRDS("pl_clean.rds")
+ll <- readRDS("ll_clean.rds")
+sa <- readRDS("sa_clean.rds")
+bl <- readRDS("bl_clean.rds")
+
+names(pl)
+names(ll)
+names(sa)
+names(bl)
+
+nrow(pl)
+nrow(ll)
+nrow(sa)
+nrow(bl)
+```
+
