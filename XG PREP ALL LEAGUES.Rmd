@@ -1,0 +1,148 @@
+---
+title: "XG SETUP LL, SA, BL"
+output: html_document
+date: "2026-04-15"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(worldfootballR)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(zoo)
+library(readr)
+
+exp_weights <- exp(seq(0, 1, length.out = 5))
+exp_weights <- exp_weights / sum(exp_weights)
+
+wmean5 <- function(x) {
+  weighted.mean(x, w = exp_weights, na.rm = TRUE)
+}
+
+create_team_match_df <- function(league_name) {
+  
+  shots <- load_understat_league_shots(league = league_name)
+  
+  match_xg <- shots %>%
+    filter(season >= 2016, season <= 2024) %>%
+    mutate(h_a = coalesce(h_a, home_away)) %>%
+    group_by(
+      match_id, league, season, date,
+      home_team, away_team, home_goals, away_goals
+    ) %>%
+    summarise(
+      home_xG_openplay = sum(xG[h_a == "h" & situation == "OpenPlay"], na.rm = TRUE),
+      away_xG_openplay = sum(xG[h_a == "a" & situation == "OpenPlay"], na.rm = TRUE),
+      home_xG_freekick = sum(xG[h_a == "h" & situation == "DirectFreekick"], na.rm = TRUE),
+      away_xG_freekick = sum(xG[h_a == "a" & situation == "DirectFreekick"], na.rm = TRUE),
+      home_xG_corner   = sum(xG[h_a == "h" & situation == "FromCorner"], na.rm = TRUE),
+      away_xG_corner   = sum(xG[h_a == "a" & situation == "FromCorner"], na.rm = TRUE),
+      home_xG_penalty  = sum(xG[h_a == "h" & situation == "Penalty"], na.rm = TRUE),
+      away_xG_penalty  = sum(xG[h_a == "a" & situation == "Penalty"], na.rm = TRUE),
+      home_xG_setpiece = sum(xG[h_a == "h" & situation == "SetPiece"], na.rm = TRUE),
+      away_xG_setpiece = sum(xG[h_a == "a" & situation == "SetPiece"], na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(date = as.Date(date)) %>%
+    arrange(date)
+  
+  model_df <- bind_rows(
+    match_xg %>%
+      transmute(
+        match_id, season, date,
+        team        = home_team,
+        opponent    = away_team,
+        home_away   = "home",
+        goals       = home_goals,
+        xG_openplay = home_xG_openplay,
+        xG_freekick = home_xG_freekick,
+        xG_corner   = home_xG_corner,
+        xG_penalty  = home_xG_penalty,
+        xG_setpiece = home_xG_setpiece
+      ),
+    match_xg %>%
+      transmute(
+        match_id, season, date,
+        team        = away_team,
+        opponent    = home_team,
+        home_away   = "away",
+        goals       = away_goals,
+        xG_openplay = away_xG_openplay,
+        xG_freekick = away_xG_freekick,
+        xG_corner   = away_xG_corner,
+        xG_penalty  = away_xG_penalty,
+        xG_setpiece = away_xG_setpiece
+      )
+  ) %>%
+    arrange(team, date)
+  
+  model_df <- model_df %>%
+    group_by(team) %>%
+    mutate(
+      roll_xG_openplay = lag(
+        rollapply(xG_openplay, 5, FUN = wmean5, fill = NA, align = "right"),
+        1
+      ),
+      roll_xG_freekick = lag(
+        rollapply(xG_freekick, 5, FUN = wmean5, fill = NA, align = "right"),
+        1
+      ),
+      sd_xG = lag(
+        rollapply(
+          xG_openplay + xG_corner + xG_freekick + xG_penalty + xG_setpiece,
+          5,
+          FUN = sd,
+          fill = NA,
+          align = "right"
+        ),
+        1
+      )
+    ) %>%
+    ungroup()
+  
+  team_match_df <- model_df %>%
+    left_join(
+      model_df %>%
+        select(
+          match_id,
+          opponent             = team,
+          opp_roll_xG_openplay = roll_xG_openplay,
+          opp_roll_xG_freekick = roll_xG_freekick,
+          opp_sd_xG            = sd_xG
+        ),
+      by = c("match_id", "opponent")
+    ) %>%
+    mutate(home_flag = if_else(home_away == "home", 1, 0)) %>%
+    select(
+      match_id, season, date, team, opponent, goals,
+      roll_xG_openplay, roll_xG_freekick,
+      opp_roll_xG_openplay, opp_roll_xG_freekick,
+      sd_xG, opp_sd_xG,
+      home_flag
+    ) %>%
+    drop_na() %>%
+    arrange(date)
+  
+  team_match_df
+}
+
+ll_team_match_df <- create_team_match_df("La liga")
+sa_team_match_df <- create_team_match_df("Serie A")
+bl_team_match_df <- create_team_match_df("Bundesliga")
+
+saveRDS(ll_team_match_df, "ll_team_match_df.rds")
+saveRDS(sa_team_match_df, "sa_team_match_df.rds")
+saveRDS(bl_team_match_df, "bl_team_match_df.rds")
+
+nrow(ll_team_match_df)
+nrow(sa_team_match_df)
+nrow(bl_team_match_df)
+
+names(ll_team_match_df)
+```
+
+
