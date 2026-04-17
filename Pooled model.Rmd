@@ -1,0 +1,587 @@
+---
+title: "Samlet dokument"
+output: html_document
+date: "2026-04-17"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Load packages
+```{r}
+library(readr)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(tibble)
+```
+
+Helper functions
+```{r}
+log_loss <- function(actual, predicted) {
+  predicted <- pmax(pmin(predicted, 1 - 1e-15), 1e-15)
+  -mean(actual * log(predicted) + (1 - actual) * log(1 - predicted))
+}
+
+brier_score <- function(actual, predicted) {
+  mean((actual - predicted)^2)
+}
+
+make_calibration_table <- function(actual, pred, bucket_width = 0.1) {
+  tibble(actual = actual, pred = pred) %>%
+    filter(!is.na(actual), !is.na(pred)) %>%
+    mutate(
+      prob_bucket = cut(
+        pred,
+        breaks = seq(0, 1, by = bucket_width),
+        include.lowest = TRUE
+      )
+    ) %>%
+    group_by(prob_bucket) %>%
+    summarise(
+      n = n(),
+      avg_pred = mean(pred),
+      actual_rate = mean(actual),
+      .groups = "drop"
+    )
+}
+
+add_profit <- function(df) {
+  df %>%
+    mutate(
+      odds = 1 / fair_home,
+      profit = if_else(home_win.y == 1, odds - 1, -1)
+    )
+}
+
+select_high_lambda_bets <- function(df, prob_low = 0.4, prob_high = 0.6, q = 0.6) {
+  cutoffs <- df %>%
+    group_by(league) %>%
+    summarise(lambda_cutoff = quantile(lambda_sum_nb, q, na.rm = TRUE), .groups = "drop")
+  
+  df %>%
+    left_join(cutoffs, by = "league") %>%
+    filter(
+      fair_home > prob_low & fair_home < prob_high,
+      lambda_sum_nb > lambda_cutoff
+    )
+}
+
+select_low_lambda_bets <- function(df, prob_low = 0.4, prob_high = 0.6, q = 0.4) {
+  cutoffs <- df %>%
+    group_by(league) %>%
+    summarise(lambda_cutoff = quantile(lambda_sum_nb, q, na.rm = TRUE), .groups = "drop")
+  
+  df %>%
+    left_join(cutoffs, by = "league") %>%
+    filter(
+      fair_home > prob_low & fair_home < prob_high,
+      lambda_sum_nb < lambda_cutoff
+    )
+}
+
+select_median_lambda_bets <- function(df, prob_low = 0.4, prob_high = 0.6) {
+  cutoffs <- df %>%
+    group_by(league) %>%
+    summarise(lambda_cutoff = median(lambda_sum_nb, na.rm = TRUE), .groups = "drop")
+  
+  df %>%
+    left_join(cutoffs, by = "league") %>%
+    filter(
+      fair_home > prob_low & fair_home < prob_high,
+      lambda_sum_nb > lambda_cutoff
+    )
+}
+```
+
+Load pooled data
+```{r}
+pl <- readRDS("pl_match_test_eval.rds") %>%
+  mutate(league = "PL")
+
+ll <- readRDS("ll_match_test_eval.rds") %>%
+  mutate(league = "LL")
+
+sa <- readRDS("sa_match_test_eval.rds") %>%
+  mutate(league = "SA")
+
+bl <- readRDS("bl_match_test_eval.rds") %>%
+  mutate(league = "BL")
+
+pooled <- bind_rows(pl, ll, sa, bl)
+```
+
+Check pooled sample
+```{r}
+nrow(pooled)
+
+table(pooled$league)
+table(pooled$season)
+```
+Main pooled out-of-sample comparison
+```{r}
+results_pooled <- tibble(
+  model = c("Bookmaker", "NB model", "XGBoost model"),
+  log_loss = c(
+    log_loss(pooled$home_win.y, pooled$fair_home),
+    log_loss(pooled$home_win.y, pooled$p_home_nb),
+    log_loss(pooled$home_win.y, pooled$p_home_xgb)
+  ),
+  brier = c(
+    brier_score(pooled$home_win.y, pooled$fair_home),
+    brier_score(pooled$home_win.y, pooled$p_home_nb),
+    brier_score(pooled$home_win.y, pooled$p_home_xgb)
+  )
+)
+
+print(results_pooled)
+```
+Pooled calibration tables
+```{r}
+cal_book_pooled <- make_calibration_table(pooled$home_win.y, pooled$fair_home)
+cal_nb_pooled   <- make_calibration_table(pooled$home_win.y, pooled$p_home_nb)
+cal_xgb_pooled  <- make_calibration_table(pooled$home_win.y, pooled$p_home_xgb)
+
+cal_book_pooled
+cal_nb_pooled
+cal_xgb_pooled
+```
+
+Pooled subgroup analysis: favourites vs non-favourites
+```{r}
+subgroup_results_pooled <- pooled %>%
+  mutate(
+    fav_group = case_when(
+      fair_home >= 0.60 ~ "Strong home favourite",
+      fair_home >= 0.45 ~ "Moderate home favourite",
+      fair_home >= 0.30 ~ "Balanced / slight away favourite",
+      TRUE ~ "Strong away favourite"
+    )
+  ) %>%
+  group_by(fav_group) %>%
+  summarise(
+    n = n(),
+    book_log_loss = log_loss(home_win.y, fair_home),
+    nb_log_loss   = log_loss(home_win.y, p_home_nb),
+    xgb_log_loss  = log_loss(home_win.y, p_home_xgb),
+    .groups = "drop"
+  )
+
+print(subgroup_results_pooled)
+```
+Create pooled betting-strategy variables
+```{r}
+pooled <- pooled %>%
+  mutate(
+    lambda_diff_nb = lambda_home_nb - lambda_away_nb,
+    lambda_sum_nb  = lambda_home_nb + lambda_away_nb
+  )
+```
+
+Sanity check by league
+```{r}
+pooled %>%
+  group_by(league) %>%
+  summarise(
+    n = n(),
+    mean_lambda_sum = mean(lambda_sum_nb, na.rm = TRUE),
+    q50 = quantile(lambda_sum_nb, 0.5, na.rm = TRUE),
+    q60 = quantile(lambda_sum_nb, 0.6, na.rm = TRUE),
+    q70 = quantile(lambda_sum_nb, 0.7, na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+Main pooled betting strategy
+```{r}
+bets_main_pooled <- select_high_lambda_bets(pooled, 0.4, 0.6, 0.6) %>%
+  add_profit()
+
+mean(bets_main_pooled$profit, na.rm = TRUE)
+nrow(bets_main_pooled)
+table(bets_main_pooled$league)
+```
+Pooled betting strategy: median split
+```{r}
+bets_total_goals_pooled <- select_median_lambda_bets(pooled, 0.4, 0.6) %>%
+  add_profit()
+
+mean(bets_total_goals_pooled$profit, na.rm = TRUE)
+nrow(bets_total_goals_pooled)
+table(bets_total_goals_pooled$league)
+```
+Pooled betting strategy: top 40 percent
+```{r}
+bets_strict_pooled <- select_high_lambda_bets(pooled, 0.4, 0.6, 0.6) %>%
+  add_profit()
+
+mean(bets_strict_pooled$profit, na.rm = TRUE)
+nrow(bets_strict_pooled)
+table(bets_strict_pooled$league)
+```
+Pooled betting strategy: top 30 percent
+```{r}
+bets_stricter_pooled <- select_high_lambda_bets(pooled, 0.4, 0.6, 0.7) %>%
+  add_profit()
+
+mean(bets_stricter_pooled$profit, na.rm = TRUE)
+nrow(bets_stricter_pooled)
+table(bets_stricter_pooled$league)
+```
+Pooled betting strategy: low expected goals
+```{r}
+bets_low_pooled <- select_low_lambda_bets(pooled, 0.4, 0.6, 0.4) %>%
+  add_profit()
+
+mean(bets_low_pooled$profit, na.rm = TRUE)
+nrow(bets_low_pooled)
+table(bets_low_pooled$league)
+```
+Profit by expected goal intensity quintile
+```{r}
+profit_by_bin_pooled <- pooled %>%
+  group_by(league) %>%
+  mutate(bin = ntile(lambda_sum_nb, 5)) %>%
+  ungroup() %>%
+  add_profit() %>%
+  group_by(bin) %>%
+  summarise(
+    avg_profit = mean(profit, na.rm = TRUE),
+    n = n(),
+    .groups = "drop"
+  )
+
+print(profit_by_bin_pooled)
+```
+Sample size checks
+```{r}
+sample_size_checks_pooled <- tibble(
+  segment = c(
+    "Mid-range odds only",
+    "Mid-range + high total goals (median split)",
+    "Mid-range + top 40% total goals",
+    "Mid-range + top 30% total goals",
+    "Mid-range + low total goals"
+  ),
+  n = c(
+    nrow(pooled %>% filter(fair_home > 0.4 & fair_home < 0.6)),
+    nrow(bets_total_goals_pooled),
+    nrow(bets_strict_pooled),
+    nrow(bets_stricter_pooled),
+    nrow(bets_low_pooled)
+  )
+)
+
+print(sample_size_checks_pooled)
+```
+Robustness across different expected-goal cutoffs
+```{r}
+robustness_cutoffs <- c(0.50, 0.60, 0.70, 0.80)
+
+robustness_table_pooled <- purrr::map_dfr(robustness_cutoffs, function(q) {
+  
+  bets_q <- select_high_lambda_bets(pooled, 0.4, 0.6, q) %>%
+    add_profit()
+  
+  tibble(
+    quantile_cutoff = q,
+    n_bets = nrow(bets_q),
+    avg_profit = mean(bets_q$profit, na.rm = TRUE)
+  )
+})
+
+print(robustness_table_pooled)
+```
+Robustness across alternative probability ranges
+```{r}
+range_results_pooled <- bind_rows(
+  select_high_lambda_bets(pooled, 0.35, 0.65, 0.6) %>%
+    add_profit() %>%
+    summarise(range = "0.35-0.65", n_bets = n(), avg_profit = mean(profit, na.rm = TRUE)),
+  
+  select_high_lambda_bets(pooled, 0.40, 0.60, 0.6) %>%
+    add_profit() %>%
+    summarise(range = "0.40-0.60", n_bets = n(), avg_profit = mean(profit, na.rm = TRUE)),
+  
+  select_high_lambda_bets(pooled, 0.45, 0.55, 0.6) %>%
+    add_profit() %>%
+    summarise(range = "0.45-0.55", n_bets = n(), avg_profit = mean(profit, na.rm = TRUE))
+)
+
+print(range_results_pooled)
+```
+Heterogeneity across leagues
+```{r}
+league_results <- select_high_lambda_bets(pooled, 0.4, 0.6, 0.6) %>%
+  add_profit() %>%
+  group_by(league) %>%
+  summarise(
+    n_bets = n(),
+    avg_profit = mean(profit, na.rm = TRUE),
+    actual_home_win = mean(home_win.y),
+    avg_book_prob = mean(fair_home),
+    .groups = "drop"
+  )
+
+print(league_results)
+```
+Heterogeneity across seasons
+```{r}
+season_results_pooled <- select_high_lambda_bets(pooled, 0.4, 0.6, 0.6) %>%
+  add_profit() %>%
+  group_by(season) %>%
+  summarise(
+    n_bets = n(),
+    avg_profit = mean(profit, na.rm = TRUE),
+    actual_home_win = mean(home_win.y),
+    avg_book_prob = mean(fair_home),
+    .groups = "drop"
+  )
+
+print(season_results_pooled)
+```
+Heterogeneity within the mid-range segment
+```{r}
+mid_bin_results_pooled <- select_high_lambda_bets(pooled, 0.4, 0.6, 0.6) %>%
+  add_profit() %>%
+  mutate(
+    prob_bin = cut(
+      fair_home,
+      breaks = c(0.4, 0.45, 0.5, 0.55, 0.6),
+      include.lowest = TRUE
+    )
+  ) %>%
+  group_by(prob_bin) %>%
+  summarise(
+    n_bets = n(),
+    avg_profit = mean(profit, na.rm = TRUE),
+    actual_home_win = mean(home_win.y),
+    avg_book_prob = mean(fair_home),
+    .groups = "drop"
+  )
+
+print(mid_bin_results_pooled)
+```
+Direct comparison: high vs low expected goals
+```{r}
+high_low_comparison_pooled <- bind_rows(
+  select_high_lambda_bets(pooled, 0.4, 0.6, 0.6) %>%
+    add_profit() %>%
+    summarise(
+      group = "High expected goals",
+      n_bets = n(),
+      avg_profit = mean(profit, na.rm = TRUE),
+      actual_home_win = mean(home_win.y),
+      avg_book_prob = mean(fair_home)
+    ),
+  
+  select_low_lambda_bets(pooled, 0.4, 0.6, 0.4) %>%
+    add_profit() %>%
+    summarise(
+      group = "Low expected goals",
+      n_bets = n(),
+      avg_profit = mean(profit, na.rm = TRUE),
+      actual_home_win = mean(home_win.y),
+      avg_book_prob = mean(fair_home)
+    )
+)
+
+print(high_low_comparison_pooled)
+```
+Check whether returns are concentrated in a few bets
+```{r}
+bets_concentration_pooled <- select_high_lambda_bets(pooled, 0.4, 0.6, 0.6) %>%
+  add_profit()
+
+summary(bets_concentration_pooled$profit)
+
+quantile(
+  bets_concentration_pooled$profit,
+  probs = c(0, 0.1, 0.25, 0.5, 0.75, 0.9, 1),
+  na.rm = TRUE
+)
+```
+Bootstrap confidence interval for average profit
+```{r}
+set.seed(123)
+
+bets_boot_pooled <- select_high_lambda_bets(pooled, 0.4, 0.6, 0.6) %>%
+  add_profit()
+
+boot_means_pooled <- replicate(2000, {
+  sample_profit <- sample(
+    bets_boot_pooled$profit,
+    size = nrow(bets_boot_pooled),
+    replace = TRUE
+  )
+  mean(sample_profit, na.rm = TRUE)
+})
+
+quantile(boot_means_pooled, probs = c(0.025, 0.5, 0.975))
+```
+
+Placebo test
+```{r}
+set.seed(123)
+
+target_n <- nrow(
+  select_high_lambda_bets(pooled, 0.4, 0.6, 0.6)
+)
+
+all_mid_bets <- pooled %>%
+  filter(fair_home > 0.4 & fair_home < 0.6) %>%
+  add_profit()
+
+placebo_means <- replicate(2000, {
+  placebo_sample <- all_mid_bets %>%
+    slice_sample(n = target_n, replace = FALSE)
+  mean(placebo_sample$profit, na.rm = TRUE)
+})
+
+quantile(placebo_means, probs = c(0.025, 0.5, 0.975))
+
+mean(
+  select_high_lambda_bets(pooled, 0.4, 0.6, 0.6) %>%
+    add_profit() %>%
+    pull(profit)
+)
+```
+
+Wider strategy check
+```{r}
+bets_wider_pooled <- pooled %>%
+  filter(fair_home > 0.35 & fair_home < 0.65) %>%
+  group_by(league) %>%
+  filter(lambda_sum_nb > median(lambda_sum_nb, na.rm = TRUE)) %>%
+  ungroup() %>%
+  add_profit()
+
+mean(bets_wider_pooled$profit, na.rm = TRUE)
+nrow(bets_wider_pooled)
+table(bets_wider_pooled$league)
+t.test(bets_wider_pooled$profit)
+```
+
+FURTHER TESTS
+```{r}
+bets_main_pooled %>%
+  group_by(league) %>%
+  summarise(
+    mean_profit = mean(profit, na.rm = TRUE),
+    sd_profit = sd(profit, na.rm = TRUE),
+    n = n(),
+    .groups = "drop"
+  )
+
+anova_profit <- aov(profit ~ league, data = bets_main_pooled)
+summary(anova_profit)
+TukeyHSD(anova_profit)
+
+profit_lm <- lm(profit ~ league, data = bets_main_pooled)
+summary(profit_lm)
+bets_main_pooled <- bets_main_pooled %>%
+  mutate(league = relevel(factor(league), ref = "PL"))
+
+profit_lm <- lm(profit ~ league, data = bets_main_pooled)
+summary(profit_lm)
+
+high_bets <- select_high_lambda_bets(pooled, 0.4, 0.6, 0.6) %>%
+  add_profit() %>%
+  mutate(group = "High expected goals")
+
+low_bets <- select_low_lambda_bets(pooled, 0.4, 0.6, 0.4) %>%
+  add_profit() %>%
+  mutate(group = "Low expected goals")
+
+compare_high_low <- bind_rows(high_bets, low_bets)
+
+compare_high_low %>%
+  group_by(group) %>%
+  summarise(
+    mean_profit = mean(profit, na.rm = TRUE),
+    n = n(),
+    .groups = "drop"
+  )
+
+t.test(profit ~ group, data = compare_high_low)
+
+bets_reg <- pooled %>%
+  filter(fair_home > 0.4 & fair_home < 0.6) %>%
+  add_profit() %>%
+  mutate(
+    league = factor(league),
+    lambda_sum_nb = lambda_home_nb + lambda_away_nb
+  )
+
+model_interaction <- lm(profit ~ lambda_sum_nb * league, data = bets_reg)
+summary(model_interaction)
+
+bets_main_pooled %>%
+  group_by(league) %>%
+  summarise(
+    actual_home_win = mean(home_win.y, na.rm = TRUE),
+    avg_book_prob = mean(fair_home, na.rm = TRUE),
+    diff = actual_home_win - avg_book_prob,
+    .groups = "drop"
+  )
+
+set.seed(123)
+
+placebo_by_league <- purrr::map_dfr(c("PL", "LL", "SA", "BL"), function(lg) {
+  
+  league_df <- pooled %>%
+    filter(league == lg, fair_home > 0.4 & fair_home < 0.6) %>%
+    add_profit()
+  
+  target_n <- select_high_lambda_bets(pooled, 0.4, 0.6, 0.6) %>%
+    filter(league == lg) %>%
+    nrow()
+  
+  placebo_means <- replicate(2000, {
+    placebo_sample <- league_df %>%
+      slice_sample(n = target_n, replace = FALSE)
+    mean(placebo_sample$profit, na.rm = TRUE)
+  })
+  
+  actual_mean <- select_high_lambda_bets(pooled, 0.4, 0.6, 0.6) %>%
+    filter(league == lg) %>%
+    add_profit() %>%
+    summarise(m = mean(profit, na.rm = TRUE)) %>%
+    pull(m)
+  
+  tibble(
+    league = lg,
+    actual_mean = actual_mean,
+    placebo_pvalue = mean(abs(placebo_means) >= abs(actual_mean))
+  )
+})
+
+print(placebo_by_league)
+```
+
+Maybe include
+```{r}
+summary(aov(profit ~ league, data = bets_main_pooled))
+summary(lm(profit ~ league, data = bets_main_pooled))
+t.test(profit ~ group, data = compare_high_low)
+```
+Diebold Mariano test
+```{r}
+library(forecast)
+
+dm.test(
+  e1 = (pooled$home_win.y - pooled$p_home_nb)^2,
+  e2 = (pooled$home_win.y - pooled$fair_home)^2,
+  h = 1,
+  power = 2
+)
+
+dm.test(
+  e1 = (pooled$home_win.y - pooled$p_home_xgb)^2,
+  e2 = (pooled$home_win.y - pooled$fair_home)^2,
+  h = 1,
+  power = 2
+)
+```
+
+
