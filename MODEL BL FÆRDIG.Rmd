@@ -775,4 +775,8 @@ mean(bets_wider$profit, na.rm = TRUE)
 nrow(bets_wider)
 t.test(bets_wider$profit)
 ```
+Save rds
+```{r}
+saveRDS(match_test_eval, "bl_match_test_eval.rds")
+```
 
