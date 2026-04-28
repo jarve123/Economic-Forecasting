@@ -16,12 +16,6 @@ library(purrr)
 library(zoo)
 library(readr)
 
-exp_weights <- exp(seq(0, 1, length.out = 5))
-exp_weights <- exp_weights / sum(exp_weights)
-
-wmean5 <- function(x) {
-  weighted.mean(x, w = exp_weights, na.rm = TRUE)
-}
 
 create_team_match_df <- function(league_name) {
   
@@ -84,11 +78,11 @@ create_team_match_df <- function(league_name) {
     group_by(team) %>%
     mutate(
       roll_xG_openplay = lag(
-        rollapply(xG_openplay, 5, FUN = wmean5, fill = NA, align = "right"),
+        rollmean(xG_openplay, 5, fill = NA, align = "right"),
         1
       ),
       roll_xG_freekick = lag(
-        rollapply(xG_freekick, 5, FUN = wmean5, fill = NA, align = "right"),
+        rollmean(xG_freekick, 5, fill = NA, align = "right"),
         1
       ),
       sd_xG = lag(
