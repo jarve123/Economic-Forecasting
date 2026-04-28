@@ -1,0 +1,284 @@
+---
+title: "final outputs"
+output: html_document
+date: "2026-04-28"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Read all files from other documents
+```{r}
+library(dplyr)
+library(readr)
+library(tibble)
+library(purrr)
+library(lubridate)
+library(gt)
+library(scales)
+
+fix_bad_years <- function(x) {
+  x <- as.Date(x)
+  if_else(year(x) < 100, x %m+% years(2000), x)
+}
+
+# Load data
+pl <- readRDS("pl_match_test_eval.rds")
+ll <- readRDS("ll_match_test_eval.rds")
+sa <- readRDS("sa_match_test_eval.rds")
+bl <- readRDS("bl_match_test_eval.rds")
+
+pooled <- bind_rows(
+  pl %>% mutate(league = "PL"),
+  ll %>% mutate(league = "LL"),
+  sa %>% mutate(league = "SA"),
+  bl %>% mutate(league = "BL")
+)
+```
+
+MAIN PAPER OUTPUTS
+
+Data overview table
+```{r}
+data_overview_table <- bind_rows(
+  readRDS("pl_clean.rds") %>% mutate(league = "PL"),
+  readRDS("ll_clean.rds") %>% mutate(league = "LL"),
+  readRDS("sa_clean.rds") %>% mutate(league = "SA"),
+  readRDS("bl_clean.rds") %>% mutate(league = "BL")
+) %>%
+  mutate(Date = fix_bad_years(Date)) %>%
+  group_by(league) %>%
+  summarise(
+    bookmaker_matches = n(),
+    first_date = min(Date, na.rm = TRUE),
+    last_date = max(Date, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  left_join(
+    bind_rows(
+      readRDS("pl_team_match_df.rds") %>% mutate(league = "PL"),
+      readRDS("ll_team_match_df.rds") %>% mutate(league = "LL"),
+      readRDS("sa_team_match_df.rds") %>% mutate(league = "SA"),
+      readRDS("bl_team_match_df.rds") %>% mutate(league = "BL")
+    ) %>%
+      group_by(league) %>%
+      summarise(team_match_rows = n(), .groups = "drop"),
+    by = "league"
+  ) %>%
+  left_join(
+    pooled %>%
+      group_by(league) %>%
+      summarise(test_matches = n(), .groups = "drop"),
+    by = "league"
+  ) %>%
+  left_join(
+    bets_main_pooled %>%
+      group_by(league) %>%
+      summarise(main_strategy_bets = n(), .groups = "drop"),
+    by = "league"
+  )
+
+data_overview_table %>%
+  gt() %>%
+  tab_header(title = "Data overview by league") %>%
+  cols_label(
+    league = "League",
+    bookmaker_matches = "Bookmaker matches",
+    first_date = "First date",
+    last_date = "Last date",
+    team_match_rows = "Team-match rows",
+    test_matches = "Test matches",
+    main_strategy_bets = "Main strategy bets"
+  ) %>%
+  fmt_date(columns = c(first_date, last_date), date_style = "iso") %>%
+  tab_options(
+    table.font.size = 13,
+    data_row.padding = px(4)
+  )
+```
+Pooled forecast performance
+```{r}
+forecast_performance_table <- results_pooled %>%
+  mutate(
+    log_loss = round(log_loss, 4),
+    brier = round(brier, 4)
+  )
+
+forecast_performance_table %>%
+  gt() %>%
+  tab_header(
+    title = "Pooled forecast performance",
+    subtitle = "Comparison of model forecast accuracy across all leagues"
+  ) %>%
+  cols_label(
+    model = "Model",
+    log_loss = "Log loss",
+    brier = "Brier score"
+  ) %>%
+  fmt_number(
+    columns = c(log_loss, brier),
+    decimals = 4
+  ) %>%
+  tab_options(
+    table.font.size = 13,
+    data_row.padding = px(4),
+    column_labels.font.weight = "bold"
+  )
+```
+Diebold-Mariano test
+```{r}
+library(forecast)
+
+dm_nb <- dm.test(
+  e1 = (pooled$home_win.y - pooled$p_home_nb)^2,
+  e2 = (pooled$home_win.y - pooled$fair_home)^2,
+  h = 1,
+  power = 2
+)
+
+dm_xgb <- dm.test(
+  e1 = (pooled$home_win.y - pooled$p_home_xgb)^2,
+  e2 = (pooled$home_win.y - pooled$fair_home)^2,
+  h = 1,
+  power = 2
+)
+
+dm_table <- tibble(
+  comparison = c("NB model vs Bookmaker", "XGBoost model vs Bookmaker"),
+  dm_statistic = c(as.numeric(dm_nb$statistic), as.numeric(dm_xgb$statistic)),
+  p_value = c(dm_nb$p.value, dm_xgb$p.value)
+) %>%
+  mutate(
+    dm_statistic = round(dm_statistic, 3),
+    p_value = signif(p_value, 3)
+  )
+
+dm_table %>%
+  gt() %>%
+  tab_header(
+    title = "Diebold-Mariano test",
+    subtitle = "Forecast accuracy compared with bookmaker probabilities"
+  ) %>%
+  cols_label(
+    comparison = "Comparison",
+    dm_statistic = "DM statistic",
+    p_value = "p-value"
+  ) %>%
+  fmt_number(
+    columns = dm_statistic,
+    decimals = 3
+  ) %>%
+  fmt_number(
+    columns = p_value,
+    decimals = 3
+  ) %>%
+  tab_options(
+    table.font.size = 13,
+    data_row.padding = px(4),
+    column_labels.font.weight = "bold"
+  )
+```
+Main betting strategy with bootstrap CI
+```{r}
+main_strategy_table <- tibble(
+  strategy = "Mid-range odds + high expected goal intensity",
+  avg_profit = mean(bets_main_pooled$profit, na.rm = TRUE),
+  n_bets = nrow(bets_main_pooled),
+  ci_lower = quantile(boot_means_pooled, 0.025, na.rm = TRUE),
+  ci_median = quantile(boot_means_pooled, 0.5, na.rm = TRUE),
+  ci_upper = quantile(boot_means_pooled, 0.975, na.rm = TRUE)
+) %>%
+  mutate(
+    avg_profit = round(avg_profit, 4),
+    ci_lower = round(ci_lower, 4),
+    ci_median = round(ci_median, 4),
+    ci_upper = round(ci_upper, 4)
+  )
+
+main_strategy_table %>%
+  gt() %>%
+  tab_header(
+    title = "Main betting strategy",
+    subtitle = "Average profit with bootstrap confidence interval"
+  ) %>%
+  cols_label(
+    strategy = "Strategy",
+    avg_profit = "Average profit",
+    n_bets = "Number of bets",
+    ci_lower = "CI lower",
+    ci_median = "CI median",
+    ci_upper = "CI upper"
+  ) %>%
+  fmt_number(
+    columns = c(avg_profit, ci_lower, ci_median, ci_upper),
+    decimals = 4
+  ) %>%
+  tab_options(
+    table.font.size = 13,
+    data_row.padding = px(4),
+    column_labels.font.weight = "bold"
+  )
+```
+League heterogeneity table
+```{r}
+league_heterogeneity_table <- league_results %>%
+  mutate(
+    diff_actual_vs_book = actual_home_win - avg_book_prob,
+    avg_profit = round(avg_profit, 4),
+    actual_home_win = round(actual_home_win, 4),
+    avg_book_prob = round(avg_book_prob, 4),
+    diff_actual_vs_book = round(diff_actual_vs_book, 4)
+  )
+
+league_heterogeneity_table %>%
+  gt() %>%
+  tab_header(
+    title = "League heterogeneity",
+    subtitle = "Differences in bookmaker probabilities, realised outcomes, and betting performance"
+  ) %>%
+  cols_label(
+    league = "League",
+    n_bets = "Number of bets",
+    avg_profit = "Average profit",
+    actual_home_win = "Actual home win rate",
+    avg_book_prob = "Average bookmaker probability",
+    diff_actual_vs_book = "Actual minus bookmaker"
+  ) %>%
+  fmt_number(
+    columns = where(is.numeric),
+    decimals = 4
+  ) %>%
+  tab_options(
+    table.font.size = 13,
+    data_row.padding = px(4),
+    column_labels.font.weight = "bold"
+  )
+```
+Robustness across expected-goal cutoffs
+```{r}
+robustness_cutoff_table <- robustness_table_pooled %>%
+  mutate(avg_profit = round(avg_profit, 4))
+
+robustness_cutoff_table %>%
+  gt() %>%
+  tab_header(
+    title = "Robustness across expected-goal cutoffs",
+    subtitle = "Average betting profit under alternative cutoff values"
+  ) %>%
+  cols_label(
+    quantile_cutoff = "Expected-goal cutoff",
+    n_bets = "Number of bets",
+    avg_profit = "Average profit"
+  ) %>%
+  fmt_number(
+    columns = avg_profit,
+    decimals = 4
+  ) %>%
+  tab_options(
+    table.font.size = 13,
+    data_row.padding = px(4),
+    column_labels.font.weight = "bold"
+  )
+```
+

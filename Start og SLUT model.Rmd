@@ -590,19 +590,29 @@ cat("\nNote: compare rmse_nb_final against rmse_poisson from Step 6\n")
 cat("for a clean like-for-like picture of improvement\n")
 
 cat("\n=== Development Journey Summary ===\n")
+
 tibble(
-  step  = c("1. Poisson (simple rolling, all 5 xG types)",
-            "2. NB (simple rolling, all 5 xG types)",
-            "3. NB (exponential weighting, all 5 xG types)",
-            "4. NB (exp. weighting + SD xG)",
-            "5. NB reduced (openplay + freekick + SD + home)"),
-  aic   = c(AIC(poisson_full), AIC(nb_for_test),
-            AIC(nb_exp), AIC(nb_with_sd), AIC(nb_no_setpiece)),
-  reason = c("Baseline — Poisson is natural for count data",
-             "Overdispersion test rejects Poisson",
-             "Recent form theoretically more informative",
-             "SD captures team consistency",
-             "Corner, penalty, setpiece not significant by AIC")
+  step  = c(
+    "1. Poisson (simple rolling, all 5 xG types)",
+    "2. NB (simple rolling, all 5 xG types)",
+    "3. NB (exponential weighting tested)",
+    "4. NB (simple rolling + SD xG)",
+    "5. NB reduced (openplay + freekick + SD + home)"
+  ),
+  aic   = c(
+    AIC(poisson_full),
+    AIC(nb_for_test),
+    AIC(nb_exp),
+    AIC(nb_with_sd),
+    AIC(nb_no_setpiece)
+  ),
+  reason = c(
+    "Baseline — Poisson is natural for count data",
+    "Overdispersion test rejects Poisson",
+    "No improvement — exponential weighting rejected",
+    "SD captures team consistency",
+    "Corner, penalty, setpiece not significant by AIC"
+  )
 ) %>%
   print()
 
