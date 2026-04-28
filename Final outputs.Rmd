@@ -282,3 +282,705 @@ robustness_cutoff_table %>%
   )
 ```
 
+APPENDIX OUTPUTS
+```{r}
+make_appendix_table <- function(data, title, subtitle = NULL) {
+  data %>%
+    gt() %>%
+    tab_header(
+      title = title,
+      subtitle = subtitle
+    ) %>%
+    tab_options(
+      table.font.size = 11,
+      data_row.padding = px(3),
+      column_labels.font.weight = "bold"
+    )
+}
+```
+
+1. Bookmaker data cleaning summary
+```{r}
+bookmaker_cleaning_table <- bind_rows(
+  readRDS("pl_clean.rds") %>% mutate(league = "Premier League"),
+  readRDS("ll_clean.rds") %>% mutate(league = "La Liga"),
+  readRDS("sa_clean.rds") %>% mutate(league = "Serie A"),
+  readRDS("bl_clean.rds") %>% mutate(league = "Bundesliga")
+) %>%
+  mutate(Date = fix_bad_years(Date)) %>%
+  group_by(league) %>%
+  summarise(
+    rows = n(),
+    first_date = min(Date, na.rm = TRUE),
+    last_date = max(Date, na.rm = TRUE),
+    missing_odds = sum(is.na(B365H) | is.na(B365D) | is.na(B365A)),
+    .groups = "drop"
+  )
+
+make_appendix_table(
+  bookmaker_cleaning_table,
+  "Bookmaker data cleaning summary"
+) %>%
+  cols_label(
+    league = "League",
+    rows = "Rows",
+    first_date = "First date",
+    last_date = "Last date",
+    missing_odds = "Missing odds"
+  ) %>%
+  fmt_date(columns = c(first_date, last_date), date_style = "iso")
+```
+Understat construction summary
+```{r}
+understat_cleaning_table <- bind_rows(
+  readRDS("pl_team_match_df.rds") %>% mutate(league = "Premier League"),
+  readRDS("ll_team_match_df.rds") %>% mutate(league = "La Liga"),
+  readRDS("sa_team_match_df.rds") %>% mutate(league = "Serie A"),
+  readRDS("bl_team_match_df.rds") %>% mutate(league = "Bundesliga")
+) %>%
+  group_by(league) %>%
+  summarise(
+    team_match_rows = n(),
+    first_date = min(date, na.rm = TRUE),
+    last_date = max(date, na.rm = TRUE),
+    teams = n_distinct(team),
+    .groups = "drop"
+  )
+
+make_appendix_table(
+  understat_cleaning_table,
+  "Understat construction summary"
+) %>%
+  cols_label(
+    league = "League",
+    team_match_rows = "Team-match rows",
+    first_date = "First date",
+    last_date = "Last date",
+    teams = "Teams"
+  ) %>%
+  fmt_date(columns = c(first_date, last_date), date_style = "iso")
+```
+Poisson and Negative Binomial comparison
+```{r}
+poisson_nb_table <- tibble(
+  statistic = c(
+    "Pearson dispersion",
+    "Likelihood ratio statistic",
+    "Likelihood ratio p-value",
+    "Poisson AIC",
+    "Negative Binomial AIC"
+  ),
+  value = c(
+    pearson_disp,
+    lrt_stat,
+    lrt_pval,
+    AIC(poisson_full),
+    AIC(nb_for_test)
+  )
+) %>%
+  mutate(value = round(value, 4))
+
+make_appendix_table(
+  poisson_nb_table,
+  "Poisson and Negative Binomial comparison"
+) %>%
+  cols_label(
+    statistic = "Statistic",
+    value = "Value"
+  )
+```
+Rolling mean and exponential weighting comparison
+```{r}
+weighting_comparison_table <- tibble(
+  weighting = c("Simple rolling mean", "Exponential weighting"),
+  aic = c(AIC(nb_full), AIC(nb_exp)),
+  rmse = c(rmse_simple, rmse_exp)
+) %>%
+  mutate(
+    aic = round(aic, 2),
+    rmse = round(rmse, 5)
+  )
+
+make_appendix_table(
+  weighting_comparison_table,
+  "Rolling mean and exponential weighting comparison"
+) %>%
+  cols_label(
+    weighting = "Weighting method",
+    aic = "AIC",
+    rmse = "RMSE"
+  )
+```
+Standard deviation xg inclusion check
+```{r}
+sd_xg_table <- tibble(
+  model = c("Without SD xG", "With SD xG"),
+  aic = c(AIC(nb_no_sd), AIC(nb_with_sd))
+) %>%
+  mutate(aic = round(aic, 2))
+
+make_appendix_table(
+  sd_xg_table,
+  "Standard deviation xG inclusion check"
+) %>%
+  cols_label(
+    model = "Model",
+    aic = "AIC"
+  )
+```
+Home advantage model comparison
+```{r}
+home_advantage_table <- tibble(
+  model = c("Without home advantage", "With home advantage"),
+  aic = c(AIC(nb_no_home), AIC(nb_with_sd))
+) %>%
+  mutate(aic = round(aic, 2))
+
+make_appendix_table(
+  home_advantage_table,
+  "Home advantage model comparison"
+) %>%
+  cols_label(
+    model = "Model",
+    aic = "AIC"
+  )
+```
+Home advantage coefficient
+```{r}
+home_coefficient_table <- tibble(
+  variable = "Home advantage",
+  estimate = home_coef["Estimate"],
+  p_value = home_coef["Pr(>|z|)"]
+) %>%
+  mutate(
+    estimate = round(estimate, 4),
+    p_value = signif(p_value, 3)
+  )
+
+make_appendix_table(
+  home_coefficient_table,
+  "Home advantage coefficient"
+) %>%
+  cols_label(
+    variable = "Variable",
+    estimate = "Estimate",
+    p_value = "p-value"
+  )
+```
+Variable reduction summary
+```{r}
+variable_reduction_table <- tibble(
+  model = c(
+    "Full model",
+    "Without corner xG",
+    "Without corner and penalty xG",
+    "Without corner, penalty and setpiece xG"
+  ),
+  aic = c(
+    AIC(nb_with_sd),
+    AIC(nb_no_corner),
+    AIC(nb_no_corner_penalty),
+    AIC(nb_no_setpiece)
+  ),
+  variables_removed = c(
+    "None",
+    "Corner",
+    "Corner, penalty",
+    "Corner, penalty, setpiece"
+  )
+) %>%
+  mutate(
+    aic = round(aic, 2),
+    aic_change = round(aic - first(aic), 2)
+  )
+
+make_appendix_table(
+  variable_reduction_table,
+  "Variable reduction summary"
+) %>%
+  cols_label(
+    model = "Model",
+    aic = "AIC",
+    variables_removed = "Variables removed",
+    aic_change = "AIC change"
+  )
+```
+Final Negative Binomial model coefficients
+```{r}
+final_nb_coef_table <- as.data.frame(coef(summary(nb_no_setpiece))) %>%
+  rownames_to_column("variable") %>%
+  as_tibble() %>%
+  mutate(across(where(is.numeric), ~ round(.x, 4)))
+
+make_appendix_table(
+  final_nb_coef_table,
+  "Final Negative Binomial model coefficients"
+)
+```
+Model development journey
+```{r}
+development_journey_table <- tibble(
+  step = c(
+    "Poisson with simple rolling means and all xG types",
+    "Negative Binomial with simple rolling means and all xG types",
+    "Negative Binomial with exponential weighting and all xG types",
+    "Negative Binomial with simple rolling means and SD xG",
+    "Reduced Negative Binomial with open-play, free-kick, SD xG and home advantage"
+  ),
+  aic = c(
+    AIC(poisson_full),
+    AIC(nb_for_test),
+    AIC(nb_exp),
+    AIC(nb_with_sd),
+    AIC(nb_no_setpiece)
+  ),
+  reason = c(
+    "Baseline count model",
+    "Overdispersion favours Negative Binomial",
+    "Tested but not retained",
+    "SD xG captures consistency",
+    "Corner, penalty and setpiece xG removed by AIC"
+  )
+) %>%
+  mutate(aic = round(aic, 2))
+
+make_appendix_table(
+  development_journey_table,
+  "Model development journey"
+) %>%
+  cols_label(
+    step = "Model step",
+    aic = "AIC",
+    reason = "Reason"
+  )
+```
+LASSO variable selection
+```{r}
+lasso_selection_table <- comparison_table %>%
+  select(
+    variable,
+    nb_selected,
+    lasso_min_sel,
+    lasso_1se_sel
+  )
+
+make_appendix_table(
+  lasso_selection_table,
+  "LASSO variable selection"
+) %>%
+  cols_label(
+    variable = "Variable",
+    nb_selected = "Selected in NB model",
+    lasso_min_sel = "Selected by LASSO lambda.min",
+    lasso_1se_sel = "Selected by LASSO lambda.1se"
+  )
+```
+LASSO agreement with Negative Binomial selection
+```{r}
+lasso_agreement_table <- comparison_table %>%
+  summarise(
+    agreement_lambda_min = mean(agree_min == "✓"),
+    agreement_lambda_1se = mean(agree_1se == "✓")
+  ) %>%
+  mutate(
+    agreement_lambda_min = round(agreement_lambda_min, 3),
+    agreement_lambda_1se = round(agreement_lambda_1se, 3)
+  )
+
+make_appendix_table(
+  lasso_agreement_table,
+  "LASSO agreement with Negative Binomial selection"
+) %>%
+  cols_label(
+    agreement_lambda_min = "Agreement with lambda.min",
+    agreement_lambda_1se = "Agreement with lambda.1se"
+  )
+```
+LASSO and Negative Binomial prediction performance
+```{r}
+lasso_performance_table <- tibble(
+  model = c("Negative Binomial reduced", "LASSO lambda.min", "LASSO lambda.1se"),
+  rmse = c(
+    sqrt(mean((y_test - test_df$pred_final_nb)^2)),
+    sqrt(mean((y_test - pred_lasso_min)^2)),
+    sqrt(mean((y_test - pred_lasso_1se)^2))
+  ),
+  mae = c(
+    mean(abs(y_test - test_df$pred_final_nb)),
+    mean(abs(y_test - pred_lasso_min)),
+    mean(abs(y_test - pred_lasso_1se))
+  )
+) %>%
+  mutate(
+    rmse = round(rmse, 5),
+    mae = round(mae, 5)
+  )
+
+make_appendix_table(
+  lasso_performance_table,
+  "LASSO and Negative Binomial prediction performance"
+) %>%
+  cols_label(
+    model = "Model",
+    rmse = "RMSE",
+    mae = "MAE"
+  )
+```
+
+Random Forest and XGBoost prediction performance
+```{r}
+rf_xgb_table <- tibble(
+  model = c("Random Forest", "XGBoost"),
+  rmse = c(
+    sqrt(mean((test_df$goals - pred_rf)^2)),
+    sqrt(mean((test_df$goals - pred_xgb_comp)^2))
+  ),
+  mae = c(
+    mean(abs(test_df$goals - pred_rf)),
+    mean(abs(test_df$goals - pred_xgb_comp))
+  ),
+  bias = c(
+    mean(pred_rf - test_df$goals),
+    mean(pred_xgb_comp - test_df$goals)
+  )
+) %>%
+  mutate(
+    rmse = round(rmse, 5),
+    mae = round(mae, 5),
+    bias = round(bias, 5)
+  )
+
+make_appendix_table(
+  rf_xgb_table,
+  "Random Forest and XGBoost prediction performance"
+) %>%
+  cols_label(
+    model = "Model",
+    rmse = "RMSE",
+    mae = "MAE",
+    bias = "Bias"
+  )
+```
+League-specific forecast performance
+```{r}
+make_league_forecast_results <- function(df, league_name) {
+  tibble(
+    league = league_name,
+    model = c("Bookmaker", "Negative Binomial", "XGBoost"),
+    log_loss = c(
+      log_loss(df$home_win.y, df$fair_home),
+      log_loss(df$home_win.y, df$p_home_nb),
+      log_loss(df$home_win.y, df$p_home_xgb)
+    ),
+    brier = c(
+      brier_score(df$home_win.y, df$fair_home),
+      brier_score(df$home_win.y, df$p_home_nb),
+      brier_score(df$home_win.y, df$p_home_xgb)
+    )
+  )
+}
+
+league_forecast_table <- bind_rows(
+  make_league_forecast_results(pl, "Premier League"),
+  make_league_forecast_results(ll, "La Liga"),
+  make_league_forecast_results(sa, "Serie A"),
+  make_league_forecast_results(bl, "Bundesliga")
+) %>%
+  mutate(
+    log_loss = round(log_loss, 4),
+    brier = round(brier, 4)
+  )
+
+make_appendix_table(
+  league_forecast_table,
+  "League-specific forecast performance"
+) %>%
+  cols_label(
+    league = "League",
+    model = "Model",
+    log_loss = "Log loss",
+    brier = "Brier score"
+  )
+```
+League-specific betting strategy results
+```{r}
+make_league_betting_result <- function(df, league_name) {
+  df <- df %>%
+    mutate(lambda_sum_nb = lambda_home_nb + lambda_away_nb)
+  
+  bets <- df %>%
+    filter(
+      fair_home > 0.4 & fair_home < 0.6,
+      lambda_sum_nb > quantile(lambda_sum_nb, 0.6, na.rm = TRUE)
+    ) %>%
+    add_profit()
+  
+  tibble(
+    league = league_name,
+    avg_profit = mean(bets$profit, na.rm = TRUE),
+    n_bets = nrow(bets),
+    actual_home_win = mean(bets$home_win.y, na.rm = TRUE),
+    avg_book_prob = mean(bets$fair_home, na.rm = TRUE)
+  )
+}
+
+league_betting_table <- bind_rows(
+  make_league_betting_result(pl, "Premier League"),
+  make_league_betting_result(ll, "La Liga"),
+  make_league_betting_result(sa, "Serie A"),
+  make_league_betting_result(bl, "Bundesliga")
+) %>%
+  mutate(
+    avg_profit = round(avg_profit, 4),
+    actual_home_win = round(actual_home_win, 4),
+    avg_book_prob = round(avg_book_prob, 4)
+  )
+
+make_appendix_table(
+  league_betting_table,
+  "League-specific betting strategy results"
+) %>%
+  cols_label(
+    league = "League",
+    avg_profit = "Average profit",
+    n_bets = "Number of bets",
+    actual_home_win = "Actual home win rate",
+    avg_book_prob = "Average bookmaker probability"
+  )
+```
+Pooled calibration table
+```{r}
+calibration_combined <- bind_rows(
+  cal_book_pooled %>% mutate(model = "Bookmaker"),
+  cal_nb_pooled %>% mutate(model = "Negative Binomial"),
+  cal_xgb_pooled %>% mutate(model = "XGBoost")
+) %>%
+  select(model, everything()) %>%
+  mutate(
+    avg_pred = round(avg_pred, 4),
+    actual_rate = round(actual_rate, 4)
+  )
+
+make_appendix_table(
+  calibration_combined,
+  "Pooled calibration table"
+) %>%
+  cols_label(
+    model = "Model",
+    avg_pred = "Average predicted probability",
+    actual_rate = "Actual home win rate"
+  )
+```
+Pooled subgroup analysis
+```{r}
+subgroup_table <- subgroup_results_pooled %>%
+  mutate(
+    book_log_loss = round(book_log_loss, 4),
+    nb_log_loss = round(nb_log_loss, 4),
+    xgb_log_loss = round(xgb_log_loss, 4)
+  )
+
+make_appendix_table(
+  subgroup_table,
+  "Pooled subgroup analysis"
+) %>%
+  cols_label(
+    book_log_loss = "Bookmaker log loss",
+    nb_log_loss = "Negative Binomial log loss",
+    xgb_log_loss = "XGBoost log loss"
+  )
+```
+Robustness across alternative probability ranges
+```{r}
+probability_range_robustness_table <- range_results_pooled %>%
+  mutate(avg_profit = round(avg_profit, 4))
+
+make_appendix_table(
+  probability_range_robustness_table,
+  "Robustness across alternative probability ranges"
+) %>%
+  cols_label(
+    avg_profit = "Average profit"
+  )
+```
+Season-level betting heterogeneity
+```{r}
+season_heterogeneity_table <- season_results_pooled %>%
+  mutate(
+    avg_profit = round(avg_profit, 4),
+    actual_home_win = round(actual_home_win, 4),
+    avg_book_prob = round(avg_book_prob, 4)
+  )
+
+make_appendix_table(
+  season_heterogeneity_table,
+  "Season-level betting heterogeneity"
+) %>%
+  cols_label(
+    avg_profit = "Average profit",
+    actual_home_win = "Actual home win rate",
+    avg_book_prob = "Average bookmaker probability"
+  )
+```
+High and low expected-goal comparison
+```{r}
+high_low_table <- high_low_comparison_pooled %>%
+  mutate(
+    diff_actual_vs_book = actual_home_win - avg_book_prob,
+    avg_profit = round(avg_profit, 4),
+    actual_home_win = round(actual_home_win, 4),
+    avg_book_prob = round(avg_book_prob, 4),
+    diff_actual_vs_book = round(diff_actual_vs_book, 4)
+  )
+
+make_appendix_table(
+  high_low_table,
+  "High and low expected-goal comparison"
+) %>%
+  cols_label(
+    avg_profit = "Average profit",
+    actual_home_win = "Actual home win rate",
+    avg_book_prob = "Average bookmaker probability",
+    diff_actual_vs_book = "Actual minus bookmaker"
+  )
+```
+Return concentration
+```{r}
+return_concentration_table <- tibble(
+  statistic = c("Minimum", "10%", "25%", "Median", "75%", "90%", "Maximum"),
+  profit = as.numeric(
+    quantile(
+      bets_concentration_pooled$profit,
+      probs = c(0, 0.1, 0.25, 0.5, 0.75, 0.9, 1),
+      na.rm = TRUE
+    )
+  )
+) %>%
+  mutate(profit = round(profit, 4))
+
+make_appendix_table(
+  return_concentration_table,
+  "Return concentration"
+) %>%
+  cols_label(
+    statistic = "Statistic",
+    profit = "Profit"
+  )
+```
+Placebo test
+```{r}
+placebo_table <- tibble(
+  placebo_ci_lower = quantile(placebo_means, 0.025, na.rm = TRUE),
+  placebo_median = quantile(placebo_means, 0.5, na.rm = TRUE),
+  placebo_ci_upper = quantile(placebo_means, 0.975, na.rm = TRUE),
+  actual_mean = mean(bets_main_pooled$profit, na.rm = TRUE)
+) %>%
+  mutate(across(everything(), ~ round(.x, 4)))
+
+make_appendix_table(
+  placebo_table,
+  "Placebo test"
+) %>%
+  cols_label(
+    placebo_ci_lower = "Placebo CI lower",
+    placebo_median = "Placebo median",
+    placebo_ci_upper = "Placebo CI upper",
+    actual_mean = "Actual mean profit"
+  )
+```
+Placebo test by league
+```{r}
+placebo_by_league_table <- placebo_by_league %>%
+  mutate(
+    actual_mean = round(actual_mean, 4),
+    placebo_pvalue = round(placebo_pvalue, 4)
+  )
+
+make_appendix_table(
+  placebo_by_league_table,
+  "Placebo test by league"
+) %>%
+  cols_label(
+    actual_mean = "Actual mean profit",
+    placebo_pvalue = "Placebo p-value"
+  )
+```
+Wider betting strategy check
+```{r}
+wider_strategy_test <- t.test(bets_wider_pooled$profit)
+
+wider_strategy_table <- tibble(
+  strategy = "Wider betting strategy",
+  avg_profit = mean(bets_wider_pooled$profit, na.rm = TRUE),
+  n_bets = nrow(bets_wider_pooled),
+  t_statistic = as.numeric(wider_strategy_test$statistic),
+  p_value = wider_strategy_test$p.value
+) %>%
+  mutate(
+    avg_profit = round(avg_profit, 4),
+    t_statistic = round(t_statistic, 3),
+    p_value = signif(p_value, 3)
+  )
+
+make_appendix_table(
+  wider_strategy_table,
+  "Wider betting strategy check"
+) %>%
+  cols_label(
+    strategy = "Strategy",
+    avg_profit = "Average profit",
+    n_bets = "Number of bets",
+    t_statistic = "t-statistic",
+    p_value = "p-value"
+  )
+```
+ANOVA test of profit differences across leagues
+```{r}
+anova_model <- aov(profit ~ league, data = bets_main_pooled)
+anova_summary <- summary(anova_model)[[1]]
+
+anova_table <- tibble(
+  test = "Profit differences across leagues",
+  f_statistic = anova_summary$`F value`[1],
+  p_value = anova_summary$`Pr(>F)`[1]
+) %>%
+  mutate(
+    f_statistic = round(f_statistic, 3),
+    p_value = signif(p_value, 3)
+  )
+
+make_appendix_table(
+  anova_table,
+  "ANOVA test of profit differences across leagues"
+) %>%
+  cols_label(
+    test = "Test",
+    f_statistic = "F-statistic",
+    p_value = "p-value"
+  )
+```
+High versus low expected-goal t-test
+```{r}
+high_low_ttest <- t.test(profit ~ group, data = compare_high_low)
+
+high_low_ttest_table <- tibble(
+  test = "High versus low expected goals",
+  t_statistic = as.numeric(high_low_ttest$statistic),
+  p_value = high_low_ttest$p.value
+) %>%
+  mutate(
+    t_statistic = round(t_statistic, 3),
+    p_value = signif(p_value, 3)
+  )
+
+make_appendix_table(
+  high_low_ttest_table,
+  "High versus low expected-goal t-test"
+) %>%
+  cols_label(
+    test = "Test",
+    t_statistic = "t-statistic",
+    p_value = "p-value"
+  )
+```
+

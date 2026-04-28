@@ -874,3 +874,59 @@ cat("This supports the choice of XGBoost over Random Forest\n")
 cat("Similar feature importance rankings → both methods agree on what matters\n")
 ```
 
+For appendix:
+
+Correlation matrix
+```{r}
+corrplot(
+  cor_matrix,
+  method = "color",
+  type = "upper",
+  addCoef.col = "black",
+  number.cex = 0.6,
+  tl.cex = 0.7,
+  tl.col = "black",
+  tl.srt = 45,
+  col = colorRampPalette(c("red", "white", "blue"))(200),
+  title = "Correlation matrix of model predictors",
+  mar = c(0, 0, 2, 0)
+)
+```
+Random Forest feature importance
+```{r}
+rf_importance_table <- importance(rf_model) %>%
+  as.data.frame() %>%
+  rownames_to_column("feature") %>%
+  as_tibble() %>%
+  mutate(across(where(is.numeric), ~ round(.x, 4))) %>%
+  arrange(desc(`%IncMSE`))
+
+make_appendix_table(
+  rf_importance_table,
+  "Random Forest feature importance"
+) %>%
+  cols_label(
+    feature = "Feature",
+    `%IncMSE` = "% increase in MSE",
+    IncNodePurity = "Increase in node purity"
+  )
+```
+XGBoost feature importance
+```{r}
+xgb_importance_table <- importance_xgb %>%
+  as_tibble() %>%
+  mutate(across(where(is.numeric), ~ round(.x, 4))) %>%
+  arrange(desc(Gain))
+
+make_appendix_table(
+  xgb_importance_table,
+  "XGBoost feature importance"
+) %>%
+  cols_label(
+    Feature = "Feature",
+    Gain = "Gain",
+    Cover = "Cover",
+    Frequency = "Frequency"
+  )
+```
+
