@@ -538,7 +538,7 @@ development_journey_table <- tibble(
     "Baseline count model",
     "Overdispersion favours Negative Binomial",
     "Tested but not retained",
-    "SD xG captures consistency",
+    "SD xG tested as a consistency measure (no AIC improvement)",
     "Corner, penalty and setpiece xG removed by AIC"
   )
 ) %>%
