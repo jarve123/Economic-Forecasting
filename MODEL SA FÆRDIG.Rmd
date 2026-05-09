@@ -547,7 +547,7 @@ print(sample_size_checks)
 ```
 Robustness across all expected-goal cutoffs
 ```{r}
-robustness_cutoffs <- seq(0.01, 0.99, by = 0.01)
+robustness_cutoffs <- seq(0.1, 0.9, by = 0.1)
 
 robustness_table <- purrr::map_dfr(robustness_cutoffs, function(q) {
   
