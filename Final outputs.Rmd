@@ -8,6 +8,8 @@ date: "2026-04-28"
 knitr::opts_chunk$set(echo = TRUE)
 ```
 
+This document creates the final tables used in the main paper and appendix. It should be run after data cleaning, league-specific model files, pooled model file, and model development file have been run in that order.
+
 Read all files from other documents
 ```{r}
 library(dplyr)
