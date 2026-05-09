@@ -450,12 +450,12 @@ match_test_eval <- match_test_eval %>%
   )
 ```
 
-Main betting strategy: mid-range odds + high expected goal intensity
+Main betting strategy: mid-range odds + above-median expected goal intensity
 ```{r}
 bets_main <- match_test_eval %>%
   filter(
     fair_home > 0.4 & fair_home < 0.6,
-    lambda_sum_nb > quantile(lambda_sum_nb, 0.6, na.rm = TRUE)
+    lambda_sum_nb > quantile(lambda_sum_nb, 0.5, na.rm = TRUE)
   ) %>%
   add_profit()
 
@@ -478,15 +478,15 @@ nrow(bets_total_goals)
 
 Betting strategy: top 40 percent
 ```{r}
-bets_strict <- match_test_eval %>%
+bets_top40 <- match_test_eval %>%
   filter(
     fair_home > 0.4 & fair_home < 0.6,
     lambda_sum_nb > quantile(lambda_sum_nb, 0.6, na.rm = TRUE)
   ) %>%
   add_profit()
 
-mean(bets_strict$profit, na.rm = TRUE)
-nrow(bets_strict)
+mean(bets_top40$profit, na.rm = TRUE)
+nrow(bets_top40)
 ```
 
 Betting strategy: top 30 percent
@@ -534,15 +534,15 @@ Sample size checks
 sample_size_checks <- tibble(
   segment = c(
     "Mid-range odds only",
-    "Mid-range + high total goals (median split)",
-    "Mid-range + top 40% total goals",
-    "Mid-range + top 30% total goals",
-    "Mid-range + low total goals"
+    "Mid-range + above-median expected goals",
+    "Mid-range + top 40% expected goals",
+    "Mid-range + top 30% expected goals",
+    "Mid-range + low expected goals"
   ),
   n = c(
     nrow(match_test_eval %>% filter(fair_home > 0.4 & fair_home < 0.6)),
-    nrow(bets_total_goals),
-    nrow(bets_strict),
+    nrow(bets_main),
+    nrow(bets_top40),
     nrow(bets_stricter),
     nrow(bets_low)
   )
@@ -550,9 +550,9 @@ sample_size_checks <- tibble(
 
 print(sample_size_checks)
 ```
-Robustness across different expected-goal cutoffs
+Robustness across all expected-goal cutoffs
 ```{r}
-robustness_cutoffs <- c(0.50, 0.60, 0.70, 0.80)
+robustness_cutoffs <- seq(0.01, 0.99, by = 0.01)
 
 robustness_table <- purrr::map_dfr(robustness_cutoffs, function(q) {
   
@@ -578,7 +578,7 @@ range_results <- bind_rows(
   match_test_eval %>%
     filter(
       fair_home > 0.35 & fair_home < 0.65,
-      lambda_sum_nb > quantile(lambda_sum_nb, 0.6, na.rm = TRUE)
+      lambda_sum_nb > quantile(lambda_sum_nb, 0.5, na.rm = TRUE)
     ) %>%
     add_profit() %>%
     summarise(range = "0.35-0.65", n_bets = n(), avg_profit = mean(profit, na.rm = TRUE)),
@@ -586,7 +586,7 @@ range_results <- bind_rows(
   match_test_eval %>%
     filter(
       fair_home > 0.40 & fair_home < 0.60,
-      lambda_sum_nb > quantile(lambda_sum_nb, 0.6, na.rm = TRUE)
+      lambda_sum_nb > quantile(lambda_sum_nb, 0.5, na.rm = TRUE)
     ) %>%
     add_profit() %>%
     summarise(range = "0.40-0.60", n_bets = n(), avg_profit = mean(profit, na.rm = TRUE)),
@@ -594,7 +594,7 @@ range_results <- bind_rows(
   match_test_eval %>%
     filter(
       fair_home > 0.45 & fair_home < 0.55,
-      lambda_sum_nb > quantile(lambda_sum_nb, 0.6, na.rm = TRUE)
+      lambda_sum_nb > quantile(lambda_sum_nb, 0.5, na.rm = TRUE)
     ) %>%
     add_profit() %>%
     summarise(range = "0.45-0.55", n_bets = n(), avg_profit = mean(profit, na.rm = TRUE))
@@ -607,7 +607,7 @@ Heterogeneity across seasons
 season_results <- match_test_eval %>%
   filter(
     fair_home > 0.4 & fair_home < 0.6,
-    lambda_sum_nb > quantile(lambda_sum_nb, 0.6, na.rm = TRUE)
+    lambda_sum_nb > quantile(lambda_sum_nb, 0.5, na.rm = TRUE)
   ) %>%
   add_profit() %>%
   group_by(season) %>%
@@ -626,7 +626,7 @@ Heterogeneity within the mid-range segment
 mid_bin_results <- match_test_eval %>%
   filter(
     fair_home > 0.4 & fair_home < 0.6,
-    lambda_sum_nb > quantile(lambda_sum_nb, 0.6, na.rm = TRUE)
+    lambda_sum_nb > quantile(lambda_sum_nb, 0.5, na.rm = TRUE)
   ) %>%
   add_profit() %>%
   mutate(
@@ -653,11 +653,11 @@ high_low_comparison <- bind_rows(
   match_test_eval %>%
     filter(
       fair_home > 0.4 & fair_home < 0.6,
-      lambda_sum_nb > quantile(lambda_sum_nb, 0.6, na.rm = TRUE)
+      lambda_sum_nb > quantile(lambda_sum_nb, 0.5, na.rm = TRUE)
     ) %>%
     add_profit() %>%
     summarise(
-      group = "High expected goals",
+      group = "Above-median expected goals",
       n_bets = n(),
       avg_profit = mean(profit, na.rm = TRUE),
       actual_home_win = mean(home_win.y),
@@ -667,11 +667,11 @@ high_low_comparison <- bind_rows(
   match_test_eval %>%
     filter(
       fair_home > 0.4 & fair_home < 0.6,
-      lambda_sum_nb < quantile(lambda_sum_nb, 0.4, na.rm = TRUE)
+      lambda_sum_nb <= quantile(lambda_sum_nb, 0.5, na.rm = TRUE)
     ) %>%
     add_profit() %>%
     summarise(
-      group = "Low expected goals",
+      group = "Below-median expected goals",
       n_bets = n(),
       avg_profit = mean(profit, na.rm = TRUE),
       actual_home_win = mean(home_win.y),
@@ -686,7 +686,7 @@ Check whether returns are concentrated in a few bets
 bets_concentration <- match_test_eval %>%
   filter(
     fair_home > 0.4 & fair_home < 0.6,
-    lambda_sum_nb > quantile(lambda_sum_nb, 0.6, na.rm = TRUE)
+    lambda_sum_nb > quantile(lambda_sum_nb, 0.5, na.rm = TRUE)
   ) %>%
   add_profit()
 
@@ -705,7 +705,7 @@ set.seed(123)
 bets_boot <- match_test_eval %>%
   filter(
     fair_home > 0.4 & fair_home < 0.6,
-    lambda_sum_nb > quantile(lambda_sum_nb, 0.6, na.rm = TRUE)
+    lambda_sum_nb > quantile(lambda_sum_nb, 0.5, na.rm = TRUE)
   ) %>%
   add_profit()
 
@@ -725,7 +725,7 @@ target_n <- nrow(
   match_test_eval %>%
     filter(
       fair_home > 0.4 & fair_home < 0.6,
-      lambda_sum_nb > quantile(lambda_sum_nb, 0.6, na.rm = TRUE)
+      lambda_sum_nb > quantile(lambda_sum_nb, 0.5, na.rm = TRUE)
     )
 )
 
@@ -745,7 +745,7 @@ mean(
   match_test_eval %>%
     filter(
       fair_home > 0.4 & fair_home < 0.6,
-      lambda_sum_nb > quantile(lambda_sum_nb, 0.6, na.rm = TRUE)
+      lambda_sum_nb > quantile(lambda_sum_nb, 0.5, na.rm = TRUE)
     ) %>%
     add_profit() %>%
     pull(profit)

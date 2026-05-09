@@ -182,7 +182,7 @@ dm_table %>%
 Main betting strategy with bootstrap CI
 ```{r}
 main_strategy_table <- tibble(
-  strategy = "Mid-range odds + high expected goal intensity",
+  strategy = "Mid-range odds + above-median expected-goal intensity",
   avg_profit = mean(bets_main_pooled$profit, na.rm = TRUE),
   n_bets = nrow(bets_main_pooled),
   ci_lower = quantile(boot_means_pooled, 0.025, na.rm = TRUE),
@@ -255,19 +255,22 @@ league_heterogeneity_table %>%
     column_labels.font.weight = "bold"
   )
 ```
-Robustness across expected-goal cutoffs
+Robustness across expected-goal percentiles
 ```{r}
 robustness_cutoff_table <- robustness_table_pooled %>%
-  mutate(avg_profit = round(avg_profit, 4))
+  mutate(
+    quantile_cutoff = scales::percent(quantile_cutoff, accuracy = 1),
+    avg_profit = round(avg_profit, 4)
+  )
 
 robustness_cutoff_table %>%
   gt() %>%
   tab_header(
-    title = "Robustness across expected-goal cutoffs",
-    subtitle = "Average betting profit under alternative cutoff values"
+    title = "Robustness across expected-goal percentiles",
+    subtitle = "Average betting profit under alternative expected-goal percentile cutoffs"
   ) %>%
   cols_label(
-    quantile_cutoff = "Expected-goal cutoff",
+    quantile_cutoff = "Expected-goal percentile cutoff",
     n_bets = "Number of bets",
     avg_profit = "Average profit"
   ) %>%
@@ -711,7 +714,7 @@ make_league_betting_result <- function(df, league_name) {
   bets <- df %>%
     filter(
       fair_home > 0.4 & fair_home < 0.6,
-      lambda_sum_nb > quantile(lambda_sum_nb, 0.6, na.rm = TRUE)
+      lambda_sum_nb > quantile(lambda_sum_nb, 0.5, na.rm = TRUE)
     ) %>%
     add_profit()
   
@@ -797,9 +800,12 @@ probability_range_robustness_table <- range_results_pooled %>%
 
 make_appendix_table(
   probability_range_robustness_table,
-  "Robustness across alternative probability ranges"
+  "Robustness across alternative probability ranges",
+  "All specifications use above-median expected-goal intensity"
 ) %>%
   cols_label(
+    range = "Bookmaker home-win probability range",
+    n_bets = "Number of bets",
     avg_profit = "Average profit"
   )
 ```
@@ -835,9 +841,11 @@ high_low_table <- high_low_comparison_pooled %>%
 
 make_appendix_table(
   high_low_table,
-  "High and low expected-goal comparison"
+  "Above- and below-median expected-goal comparison"
 ) %>%
   cols_label(
+    group = "Group",
+    n_bets = "Number of bets",
     avg_profit = "Average profit",
     actual_home_win = "Actual home win rate",
     avg_book_prob = "Average bookmaker probability",
@@ -964,7 +972,7 @@ High versus low expected-goal t-test
 high_low_ttest <- t.test(profit ~ group, data = compare_high_low)
 
 high_low_ttest_table <- tibble(
-  test = "High versus low expected goals",
+  test = "Above- versus below-median expected goals",
   t_statistic = as.numeric(high_low_ttest$statistic),
   p_value = high_low_ttest$p.value
 ) %>%
@@ -975,7 +983,7 @@ high_low_ttest_table <- tibble(
 
 make_appendix_table(
   high_low_ttest_table,
-  "High versus low expected-goal t-test"
+  "Above- versus below-median expected-goal t-test"
 ) %>%
   cols_label(
     test = "Test",

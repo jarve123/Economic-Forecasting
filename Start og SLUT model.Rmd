@@ -18,6 +18,7 @@ library(zoo)
 library(MASS)
 library(xgboost)
 library(corrplot)
+library(gt)
 
 select <- dplyr::select
 filter <- dplyr::filter
