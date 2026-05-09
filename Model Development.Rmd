@@ -3,15 +3,7 @@ title: "LASSO PÅ ALLE VARIABLER"
 output: html_document
 date: "2026-04-22"
 ---
-
 ```{r}
-# ═══════════════════════════════════════════════════════════════
-# MODEL DEVELOPMENT — APPENDIX CODE
-# Shows the full progression from baseline Poisson to final NB
-# Each step is tested and justified before moving to the next
-# ═══════════════════════════════════════════════════════════════
-
-# ── PACKAGES ───────────────────────────────────────────────────
 library(worldfootballR)
 library(tidyverse)
 library(zoo)
@@ -19,16 +11,32 @@ library(MASS)
 library(xgboost)
 library(corrplot)
 library(gt)
+library(glmnet)
+library(randomForest)
 
 select <- dplyr::select
 filter <- dplyr::filter
+```
 
-# ═══════════════════════════════════════════════════════════════
-# STEP 1: LOAD AND AGGREGATE DATA
-# Source: Understat shot-level data for EPL 2016–2024
-# Aggregated to match level with xG split by shot situation
-# ═══════════════════════════════════════════════════════════════
+Helper chunk
+```{r}
+make_appendix_table <- function(data, title, subtitle = NULL) {
+  data %>%
+    gt() %>%
+    tab_header(
+      title = title,
+      subtitle = subtitle
+    ) %>%
+    tab_options(
+      table.font.size = 11,
+      data_row.padding = px(3),
+      column_labels.font.weight = "bold"
+    )
+}
+```
 
+Load and aggregate Understat data
+```{r}
 epl_shots <- load_understat_league_shots(league = "EPL")
 
 match_xg <- epl_shots %>%
@@ -49,15 +57,10 @@ match_xg <- epl_shots %>%
     .groups = "drop"
   ) %>%
   arrange(date)
+```
 
-
-
-# ═══════════════════════════════════════════════════════════════
-# STEP 2: RESHAPE TO TEAM LEVEL
-# Each match produces two rows — one per team
-# Own xG = attacking signal; opponent xG = defensive weakness proxy
-# ═══════════════════════════════════════════════════════════════
-
+Construct team-level modelling data
+```{r}
 model_df <- bind_rows(
   match_xg %>% transmute(
     match_id, season, date,
@@ -85,13 +88,10 @@ model_df <- bind_rows(
   )
 ) %>%
   arrange(team, date)
+```
 
-# ═══════════════════════════════════════════════════════════════
-# STEP 3: SIMPLE ROLLING MEANS (5-game window, lagged)
-# Lag of 1 applied to prevent data leakage — only past games used
-# This is the baseline feature set before any weighting or SD
-# ═══════════════════════════════════════════════════════════════
-
+Rolling xG features and multicollinearity check
+```{r}
 model_df <- model_df %>%
   group_by(team) %>%
   mutate(
@@ -102,8 +102,6 @@ model_df <- model_df %>%
     roll_xG_setpiece = lag(rollmean(xG_setpiece, 5, fill = NA, align = "right"), 1)
   ) %>%
   ungroup()
-
-# ── Build team-level modelling dataframe ──────────────────────
 
 team_match_df <- model_df %>%
   left_join(
@@ -130,12 +128,6 @@ team_match_df <- model_df %>%
 cat("Modelling rows:", nrow(team_match_df), "\n")
 cat("Seasons:", paste(unique(team_match_df$season), collapse = ", "), "\n")
 
-# ═══════════════════════════════════════════════════════════════
-# STEP 4: MULTICOLLINEARITY CHECK
-# Check whether xG types are too correlated to include separately
-# Correlations above 0.8 would indicate redundancy
-# ═══════════════════════════════════════════════════════════════
-
 feature_cols <- team_match_df %>%
   select(
     roll_xG_openplay, roll_xG_corner, roll_xG_freekick,
@@ -156,26 +148,19 @@ if (nrow(high_cor) > 0) {
 } else {
   cat("No high correlations — safe to include all variables\n")
 }
+```
 
-# ═══════════════════════════════════════════════════════════════
-# STEP 5: TRAIN / TEST SPLIT
-# Time-based split — never random for time series data
-# Train: 2016–2022 | Test: 2023–2024
-# ═══════════════════════════════════════════════════════════════
-
+Train-test split
+```{r}
 train_df <- team_match_df %>% filter(season <= 2022)
 test_df  <- team_match_df %>% filter(season >= 2023)
 
 cat("Train rows:", nrow(train_df), "| Seasons:", min(train_df$season), "-", max(train_df$season), "\n")
 cat("Test rows: ", nrow(test_df),  "| Seasons:", min(test_df$season),  "-", max(test_df$season),  "\n")
+```
 
-# ═══════════════════════════════════════════════════════════════
-# STEP 6: BASELINE POISSON MODEL — ALL 5 xG TYPES + HOME FLAG
-# Starting point: Poisson is the natural model for count data
-# Goals are discrete, non-negative events → Poisson is appropriate
-# Assumption: Var(Y) = μ (equidispersion)
-# ═══════════════════════════════════════════════════════════════
-
+Poisson baseline and overdispersion test
+```{r}
 poisson_full <- glm(
   goals ~
     roll_xG_openplay + roll_xG_corner + roll_xG_freekick +
@@ -192,8 +177,6 @@ summary(poisson_full)
 test_df <- test_df %>%
   mutate(pred_poisson = predict(poisson_full, newdata = test_df, type = "response"))
 
-# ── Evaluate Poisson baseline ─────────────────────────────────
-
 cat("\n=== Poisson Baseline Evaluation ===\n")
 test_df %>%
   summarise(
@@ -203,30 +186,15 @@ test_df %>%
   ) %>%
   print()
 
-# ═══════════════════════════════════════════════════════════════
-# STEP 7: TEST FOR OVERDISPERSION
-# Poisson assumes Var(Y) = μ. If the data is overdispersed,
-# Var(Y) > μ, which violates this assumption and leads to
-# underestimated standard errors.
-#
-# Test 1: Formal likelihood ratio test — Poisson vs NB
-# If the dispersion parameter θ is significantly different from
-# infinity (pure Poisson), NB is preferred.
-#
-# Test 2: Pearson dispersion statistic
-# Dispersion = Pearson chi-squared / df
-# Values substantially above 1 indicate overdispersion
-# ═══════════════════════════════════════════════════════════════
-
-# -- Pearson dispersion statistic --------------------------------
 pearson_disp <- sum(residuals(poisson_full, type = "pearson")^2) / poisson_full$df.residual
 cat("\n=== Overdispersion Check ===\n")
 cat("Pearson dispersion statistic:", round(pearson_disp, 4), "\n")
 cat("Value of 1 = perfect Poisson fit\n")
 cat("Values > 1 indicate overdispersion\n")
+```
 
-# -- Likelihood ratio test: Poisson vs NB -----------------------
-# Fit NB to compare log-likelihoods
+Negative Binomial model comparison
+```{r}
 nb_for_test <- glm.nb(
   goals ~
     roll_xG_openplay + roll_xG_corner + roll_xG_freekick +
@@ -237,11 +205,9 @@ nb_for_test <- glm.nb(
   data = train_df
 )
 
-# LRT statistic: 2 * (logLik(NB) - logLik(Poisson))
-# Under H0 (Poisson sufficient), this follows chi-squared with 1 df
 lrt_stat <- 2 * (as.numeric(logLik(nb_for_test)) - as.numeric(logLik(poisson_full)))
-lrt_pval <- pchisq(lrt_stat, df = 1, lower.tail = FALSE) / 2  # one-sided
-# Note: divide by 2 because θ is bounded below by 0 (boundary test)
+lrt_pval <- pchisq(lrt_stat, df = 1, lower.tail = FALSE) / 2
+
 
 cat("\n=== Likelihood Ratio Test: Poisson vs Negative Binomial ===\n")
 cat("LRT statistic:", round(lrt_stat, 4), "\n")
@@ -251,19 +217,10 @@ cat("If p < 0.05 → reject Poisson in favour of NB\n")
 cat("High theta (>20) → modest overdispersion; NB still preferred\n")
 cat("as it nests Poisson and AIC will confirm whether it is worth keeping\n")
 
-# ── AIC comparison: Poisson vs NB ────────────────────────────
-
 cat("\n=== AIC: Poisson vs NB (full model) ===\n")
 cat("Poisson AIC:", AIC(poisson_full),  "\n")
 cat("NB AIC:     ", AIC(nb_for_test),   "\n")
 cat("Lower is better\n")
-
-# ═══════════════════════════════════════════════════════════════
-# STEP 8: SWITCH TO NEGATIVE BINOMIAL
-# Motivated by: LRT result, Pearson dispersion > 1, and AIC
-# NB introduces dispersion parameter θ such that Var(Y) = μ + μ²/θ
-# As θ → ∞, NB converges to Poisson
-# ═══════════════════════════════════════════════════════════════
 
 nb_full <- glm.nb(
   goals ~
@@ -289,15 +246,10 @@ test_df %>%
     bias = mean(pred_nb_full - goals)
   ) %>%
   print()
+```
 
-# ═══════════════════════════════════════════════════════════════
-# STEP 9: TEST EXPONENTIAL WEIGHTING VS SIMPLE ROLLING MEAN
-# Motivation: recent games may be more informative than older ones
-# Exponential weights give more weight to games 1–2 weeks ago
-# and less to games 4–5 weeks ago
-# Test: does switching from simple to exponential improve RMSE/AIC?
-# ═══════════════════════════════════════════════════════════════
-
+Rolling mean versus exponential weighting
+```{r}
 exp_weights <- exp(seq(0, 1, length.out = 5))
 exp_weights <- exp_weights / sum(exp_weights)
 cat("\nExponential weights (oldest → most recent):\n")
@@ -305,7 +257,6 @@ print(round(exp_weights, 3))
 
 wmean5 <- function(x) weighted.mean(x, w = exp_weights)
 
-# Build exponentially weighted version of model_df
 model_df_exp <- model_df %>%
   group_by(team) %>%
   mutate(
@@ -353,7 +304,6 @@ nb_exp <- glm.nb(
 test_exp <- test_exp %>%
   mutate(pred_nb_exp = predict(nb_exp, newdata = test_exp, type = "response"))
 
-# Side-by-side comparison: simple vs exponential rolling mean
 cat("\n=== Exponential vs Simple Rolling Mean Comparison ===\n")
 cat("Simple rolling mean NB — AIC:", AIC(nb_full), "\n")
 cat("Exponential weighted NB — AIC:", AIC(nb_exp),  "\n")
@@ -364,16 +314,10 @@ cat("Simple rolling mean RMSE:", round(rmse_simple, 5), "\n")
 cat("Exponential weighted RMSE:", round(rmse_exp,    5), "\n")
 cat("AIC prefers simple rolling mean — exponential weighting not adopted\n")
 cat("Simple rolling means are retained as the final feature construction\n")
+```
 
-# ═══════════════════════════════════════════════════════════════
-# STEP 10: ADD SD xG AS A FEATURE
-# Motivation: rolling mean alone does not capture team consistency
-# A high mean from an erratic team is less reliable than the same
-# mean from a consistent team
-# SD xG measures variability in total xG over the last 5 games
-# Test: does adding SD xG improve AIC?
-# ═══════════════════════════════════════════════════════════════
-
+SD xG and home advantage checks
+```{r}
 model_df <- model_df %>%
   group_by(team) %>%
   mutate(
@@ -383,7 +327,6 @@ model_df <- model_df %>%
   ) %>%
   ungroup()
 
-# Rebuild team_match_df with sd_xG included
 team_match_df <- model_df %>%
   left_join(
     model_df %>%
@@ -408,7 +351,6 @@ team_match_df <- model_df %>%
 train_df <- team_match_df %>% filter(season <= 2022)
 test_df  <- team_match_df %>% filter(season >= 2023)
 
-# NB without SD (re-run on updated split for clean comparison)
 nb_no_sd <- glm.nb(
   goals ~
     roll_xG_openplay + roll_xG_corner + roll_xG_freekick +
@@ -419,7 +361,6 @@ nb_no_sd <- glm.nb(
   data = train_df
 )
 
-# NB with SD added
 nb_with_sd <- glm.nb(
   goals ~
     roll_xG_openplay + roll_xG_corner + roll_xG_freekick +
@@ -435,14 +376,6 @@ cat("Without SD xG AIC:", AIC(nb_no_sd),   "\n")
 cat("With SD xG AIC:   ", AIC(nb_with_sd), "\n")
 cat("Lower is better — if difference > 2, SD xG is worth keeping\n")
 
-# From here we proceed with SD xG included
-
-# ═══════════════════════════════════════════════════════════════
-# STEP 11: ADD HOME ADVANTAGE AND CONFIRM IT IS SIGNIFICANT
-# Home advantage is well-documented in football literature
-# Confirm it improves the model before keeping it
-# ═══════════════════════════════════════════════════════════════
-
 nb_no_home <- glm.nb(
   goals ~
     roll_xG_openplay + roll_xG_corner + roll_xG_freekick +
@@ -456,25 +389,15 @@ cat("\n=== AIC: Without vs With Home Flag ===\n")
 cat("Without home flag AIC:", AIC(nb_no_home),   "\n")
 cat("With home flag AIC:   ", AIC(nb_with_sd),   "\n")
 
-# Check coefficient significance in the full model
 home_coef <- coef(summary(nb_with_sd))["home_flag", ]
 cat("\nHome flag coefficient:", round(home_coef["Estimate"], 4), "\n")
 cat("p-value:              ", round(home_coef["Pr(>|z|)"], 6), "\n")
+```
 
-# ═══════════════════════════════════════════════════════════════
-# STEP 12: STEP-BY-STEP VARIABLE REDUCTION
-# Check significance of each xG type in the NB model
-# Remove one at a time (least significant first) and confirm
-# with AIC that the reduced model is equally good or better
-#
-# Variables under review: corner, penalty, setpiece
-# Openplay and freekick are expected to be the main signals
-# ═══════════════════════════════════════════════════════════════
-
+Variable reduction
+```{r}
 cat("\n=== Full Model Coefficients (p-values) ===\n")
 print(round(coef(summary(nb_with_sd)), 4))
-
-# ── Stage 1: Remove corner xG (check significance first) ──────
 
 nb_no_corner <- glm.nb(
   goals ~
@@ -491,8 +414,6 @@ cat("Full model AIC:          ", AIC(nb_with_sd),  "\n")
 cat("Without corner xG AIC:   ", AIC(nb_no_corner), "\n")
 cat("If AIC does not increase by >2 → corner xG not needed\n")
 
-# ── Stage 2: Remove penalty xG ────────────────────────────────
-
 nb_no_corner_penalty <- glm.nb(
   goals ~
     roll_xG_openplay + roll_xG_freekick +
@@ -507,8 +428,6 @@ cat("\n=== Stage 2: Remove penalty xG ===\n")
 cat("Without corner AIC:              ", AIC(nb_no_corner),          "\n")
 cat("Without corner + penalty AIC:    ", AIC(nb_no_corner_penalty),  "\n")
 cat("If AIC does not increase by >2 → penalty xG not needed\n")
-
-# ── Stage 3: Remove setpiece xG ───────────────────────────────
 
 nb_no_setpiece <- glm.nb(
   goals ~
@@ -525,8 +444,6 @@ cat("Without corner + penalty AIC:         ", AIC(nb_no_corner_penalty), "\n")
 cat("Without corner + penalty + setpiece:  ", AIC(nb_no_setpiece),       "\n")
 cat("If AIC does not increase by >2 → setpiece xG not needed\n")
 
-# ── Full AIC reduction summary ────────────────────────────────
-
 cat("\n=== Variable Reduction Summary ===\n")
 tibble(
   model        = c("Full (all 5 xG types)", "Remove corner",
@@ -541,17 +458,9 @@ tibble(
 
 cat("\nFinal retained variables: openplay, freekick, SD xG, home flag\n")
 
-# ── Confirm significance of remaining variables ───────────────
-
 cat("\n=== Final Reduced NB Model Summary ===\n")
 summary(nb_no_setpiece)
 cat("\nTheta:", round(nb_no_setpiece$theta, 4), "\n")
-
-# ═══════════════════════════════════════════════════════════════
-# STEP 13: DISTRIBUTION CHECK
-# Compare how well the final NB model captures the goal
-# distribution relative to actuals
-# ═══════════════════════════════════════════════════════════════
 
 test_df <- test_df %>%
   mutate(pred_final_nb = predict(nb_no_setpiece, 
@@ -572,12 +481,10 @@ test_df %>%
     by = "goals"
   ) %>%
   print()
-# ═══════════════════════════════════════════════════════════════
-# STEP 14: FINAL MODEL EVALUATION — FINAL NB
-# Poisson baseline was evaluated cleanly in Step 6.
-# Final comparison shows improvement from full to reduced NB specification.
-# ═══════════════════════════════════════════════════════════════
+```
 
+Final NB model evaluation
+```{r}
 cat("\n=== Final NB Model Evaluation ===\n")
 test_df %>%
   summarise(
@@ -586,9 +493,6 @@ test_df %>%
     bias_nb_final = mean(pred_final_nb - goals)
   ) %>%
   print()
-
-cat("\nNote: compare rmse_nb_final against rmse_poisson from Step 6\n")
-cat("for a clean like-for-like picture of improvement\n")
 
 cat("\n=== Development Journey Summary ===\n")
 
@@ -611,33 +515,17 @@ tibble(
     "Baseline — Poisson is natural for count data",
     "Overdispersion test rejects Poisson",
     "No improvement — exponential weighting rejected",
-    "SD captures team consistency",
+    "SD xG tested as consistency measure",
     "Corner, penalty, setpiece not significant by AIC"
   )
 ) %>%
   print()
 
 cat("\n=== Final variables: openplay, freekick, SD xG, home flag ===\n")
+```
 
-# ═══════════════════════════════════════════════════════════════
-# STEP 16: LASSO AS ROBUSTNESS CHECK
-# Purpose: independently validate NB variable selection using
-# a data-driven penalisation method on the FULL variable set
-#
-# LASSO receives ALL 13 variables — no prior selection applied
-# If LASSO independently zeros out the same variables the NB
-# dropped (corner, penalty, setpiece), the selection is validated
-# If LASSO disagrees, this is reported honestly and discussed
-#
-# Two lambda values tested:
-# lambda.min → lowest CV error, less penalised, keeps more variables
-# lambda.1se → most regularised within 1 SE, sparser solution
-# ═══════════════════════════════════════════════════════════════
-
-library(glmnet)
-
-# Full variable set — all 5 xG types for both team and opponent
-# plus SD xG and home flag — nothing pre-selected
+LASSO validation
+```{r}
 lasso_features <- c(
   "roll_xG_openplay", "roll_xG_corner", "roll_xG_freekick",
   "roll_xG_penalty",  "roll_xG_setpiece", "sd_xG",
@@ -646,15 +534,11 @@ lasso_features <- c(
   "home_flag"
 )
 
-# Prepare matrices
 x_train <- as.matrix(train_df[, lasso_features])
 y_train <- train_df$goals
 x_test  <- as.matrix(test_df[, lasso_features])
 y_test  <- test_df$goals
 
-# Cross-validated LASSO with Poisson family
-# alpha = 1 → pure LASSO (not ridge)
-# nfolds = 10 → 10-fold cross-validation to select lambda
 set.seed(123)
 lasso_cv <- cv.glmnet(
   x      = x_train,
@@ -667,8 +551,6 @@ lasso_cv <- cv.glmnet(
 cat("\n=== LASSO Cross-Validation ===\n")
 cat("Lambda min (lowest CV error):       ", round(lasso_cv$lambda.min, 6), "\n")
 cat("Lambda 1se (sparsest within 1 SE):  ", round(lasso_cv$lambda.1se, 6), "\n")
-
-# ── Extract coefficients at both lambda values ────────────────
 
 coefs_min <- coef(lasso_cv, s = "lambda.min") %>%
   as.matrix() %>%
@@ -686,13 +568,11 @@ coefs_1se <- coef(lasso_cv, s = "lambda.1se") %>%
   filter(variable != "(Intercept)") %>%
   mutate(lasso_1se = round(lasso_1se, 4))
 
-# NB final model coefficients — NA for variables not in NB model
 nb_coef_df <- data.frame(
   variable = names(coef(nb_no_setpiece))[-1],
   nb_coef  = round(coef(nb_no_setpiece)[-1], 4)
 )
 
-# ── Comparison table ──────────────────────────────────────────
 cat("\n=== Variable Selection Comparison: NB vs LASSO ===\n")
 cat("Zero in LASSO columns = variable removed by penalisation\n")
 cat("NA in NB column = variable not selected by AIC reduction\n\n")
@@ -711,7 +591,6 @@ comparison_table <- data.frame(variable = lasso_features) %>%
 
 print(comparison_table)
 
-# ── Agreement summary ─────────────────────────────────────────
 cat("\n=== Agreement Summary (lambda.min) ===\n")
 
 cat("Both NB and LASSO selected:\n")
@@ -732,7 +611,6 @@ if (nrow(disagreements) == 0) {
   disagreements %>% select(variable, nb_selected, lasso_min_sel) %>% print()
 }
 
-# ── Prediction performance ────────────────────────────────────
 pred_lasso_min <- as.numeric(predict(lasso_cv, newx = x_test,
                                      s = "lambda.min", type = "response"))
 pred_lasso_1se <- as.numeric(predict(lasso_cv, newx = x_test,
@@ -755,41 +633,16 @@ tibble(
   print()
 
 cat("\nSimilar RMSE across models → same signal captured regardless of method\n")
-cat("This supports the validity of the NB variable selection\n")
+cat("This provides a robustness check for the NB variable selection\n")
+```
 
-
-# ═══════════════════════════════════════════════════════════════
-# STEP 17: RANDOM FOREST VS XGBOOST COMPARISON
-# Purpose: justify the choice of XGBoost over Random Forest
-# Both are tree-based, non-parametric methods
-# The difference is how trees are built:
-#   Random Forest → bagging: trees built independently, averaged
-#   XGBoost       → boosting: trees built sequentially, each
-#                   correcting the errors of the previous one
-#
-# For small tabular datasets, boosting typically outperforms
-# bagging because it focuses learning on difficult cases
-# This comparison provides empirical evidence for that claim
-# in the context of this specific dataset
-#
-# Both models use the same final variable set as the NB model
-# for a fair comparison
-# ═══════════════════════════════════════════════════════════════
-
-library(randomForest)
-
-# Use the same final feature set as NB and XGBoost
+Random Forest and XGBoost comparison
+```{r}
 rf_features <- c(
   "roll_xG_openplay", "roll_xG_freekick", "sd_xG",
   "opp_roll_xG_openplay", "opp_roll_xG_freekick", "opp_sd_xG",
   "home_flag"
 )
-
-# ── Fit Random Forest ─────────────────────────────────────────
-# ntree = 500 → same number of trees as XGBoost rounds
-# mtry  = floor(sqrt(p)) → standard default for regression RF
-#         where p is the number of features
-# We use the same train/test split as all other models
 
 set.seed(123)
 rf_model <- randomForest(
@@ -803,10 +656,8 @@ rf_model <- randomForest(
 cat("\n=== Random Forest Model Summary ===\n")
 print(rf_model)
 
-# ── Predictions ───────────────────────────────────────────────
 pred_rf <- predict(rf_model, newdata = test_df[, rf_features])
 
-# ── Refit XGBoost on same reduced feature set for fair comparison
 xgb_features <- rf_features
 
 train_matrix_xgb <- xgb.DMatrix(
@@ -838,7 +689,6 @@ xgb_model_comp <- xgb.train(
 
 pred_xgb_comp <- predict(xgb_model_comp, test_matrix_xgb)
 
-# ── Head to head comparison ───────────────────────────────────
 cat("\n=== Random Forest vs XGBoost: Head to Head ===\n")
 cat("Same variable set, same train/test split\n")
 cat("Any performance difference is due to model structure only\n\n")
@@ -860,7 +710,6 @@ tibble(
 ) %>%
   print()
 
-# ── Feature importance comparison ────────────────────────────
 cat("\n=== Feature Importance: Random Forest ===\n")
 importance_rf <- importance(rf_model)
 print(round(importance_rf, 4))
@@ -871,11 +720,11 @@ print(importance_xgb)
 
 cat("\n=== Interpretation ===\n")
 cat("If XGBoost RMSE < RF RMSE → boosting outperforms bagging on this dataset\n")
-cat("This supports the choice of XGBoost over Random Forest\n")
+cat("This compares XGBoost with Random Forest using the same feature set\n")
 cat("Similar feature importance rankings → both methods agree on what matters\n")
 ```
 
-For appendix:
+Final outputs for appendix:
 
 Correlation matrix
 ```{r}
