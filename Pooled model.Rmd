@@ -15,6 +15,7 @@ library(dplyr)
 library(tidyr)
 library(purrr)
 library(tibble)
+library(forecast)
 ```
 
 Helper functions
@@ -68,7 +69,7 @@ select_high_lambda_bets <- function(df, prob_low = 0.4, prob_high = 0.6, q = 0.5
     )
 }
 
-select_low_lambda_bets <- function(df, prob_low = 0.4, prob_high = 0.6, q = 0.4) {
+select_low_lambda_bets <- function(df, prob_low = 0.4, prob_high = 0.6, q = 0.5) {
   cutoffs <- df %>%
     group_by(league) %>%
     summarise(lambda_cutoff = quantile(lambda_sum_nb, q, na.rm = TRUE), .groups = "drop")
@@ -274,7 +275,7 @@ sample_size_checks_pooled <- tibble(
 
 print(sample_size_checks_pooled)
 ```
-Robustness across all expected-goal cutoffs
+Robustness across expected-goal decile cutoffs
 ```{r}
 robustness_cutoffs <- seq(0.1, 0.9, by = 0.1)
 
@@ -462,7 +463,7 @@ table(bets_wider_pooled$league)
 t.test(bets_wider_pooled$profit)
 ```
 
-FURTHER TESTS
+Additional statistical tests
 ```{r}
 bets_main_pooled %>%
   group_by(league) %>%
@@ -559,16 +560,8 @@ placebo_by_league <- purrr::map_dfr(c("PL", "LL", "SA", "BL"), function(lg) {
 print(placebo_by_league)
 ```
 
-Maybe include
-```{r}
-summary(aov(profit ~ league, data = bets_main_pooled))
-summary(lm(profit ~ league, data = bets_main_pooled))
-t.test(profit ~ group, data = compare_high_low)
-```
 Diebold Mariano test
 ```{r}
-library(forecast)
-
 dm.test(
   e1 = (pooled$home_win.y - pooled$p_home_nb)^2,
   e2 = (pooled$home_win.y - pooled$fair_home)^2,

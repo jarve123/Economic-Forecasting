@@ -1,7 +1,7 @@
 ---
-title: "INDEPENDENT PL DONE"
+title: "SA model"
 output: html_document
-date: "2026-04-15"
+date: "2026-04-17"
 ---
 
 ```{r setup, include=FALSE}
@@ -89,22 +89,19 @@ add_profit <- function(df) {
 
 Load data
 ```{r}
-pl <- readRDS("pl_clean.rds")
-team_match_df <- readRDS("pl_team_match_df.rds")
+sa <- readRDS("sa_clean.rds")
+team_match_df <- readRDS("sa_team_match_df.rds")
 ```
 
 Team name mapping and clean bookmaker data
 ```{r}
 team_map <- c(
-  "Man City" = "Manchester City",
-  "Man United" = "Manchester United",
-  "Newcastle" = "Newcastle United",
-  "Nott'm Forest" = "Nottingham Forest",
-  "West Brom" = "West Bromwich Albion",
-  "Wolves" = "Wolverhampton Wanderers"
+  "Milan" = "AC Milan",
+  "Parma" = "Parma Calcio 1913",
+  "Spal" = "SPAL 2013"
 )
 
-pl <- pl %>%
+sa <- sa %>%
   mutate(
     HomeTeam = recode(HomeTeam, !!!team_map),
     AwayTeam = recode(AwayTeam, !!!team_map),
@@ -115,9 +112,9 @@ pl <- pl %>%
 
 Create bookmaker fair probabilities
 ```{r}
-fair_probs <- make_fair_probs(pl$B365H, pl$B365D, pl$B365A)
+fair_probs <- make_fair_probs(sa$B365H, sa$B365D, sa$B365A)
 
-pl <- bind_cols(pl, fair_probs)
+sa <- bind_cols(sa, fair_probs)
 ```
 
 Keep only required columns
@@ -258,7 +255,7 @@ match_train <- home_train %>%
   )
 ```
 
-Convet team-level predictions to match-level rows: test
+Convert team-level predictions to match-level rows: test
 ```{r}
 home_test <- test_df %>%
   filter(home_flag == 1) %>%
@@ -349,9 +346,10 @@ probs_test_xgb <- pmap_dfr(
 
 match_test <- bind_cols(match_test, probs_test_nb, probs_test_xgb)
 ```
+
 Merge bookmaker benchmark into train sample
 ```{r}
-book_train <- pl %>%
+book_train <- sa %>%
   filter(Date < as.Date("2023-08-01")) %>%
   select(
     Date, HomeTeam, AwayTeam, home_win,
@@ -367,7 +365,7 @@ match_train <- match_train %>%
 
 Merge bookmaker benchmark into test sample
 ```{r}
-book_test <- pl %>%
+book_test <- sa %>%
   filter(Date >= as.Date("2023-08-01")) %>%
   select(
     Date, HomeTeam, AwayTeam, home_win,
@@ -418,7 +416,6 @@ cal_book
 cal_nb
 cal_xgb
 ```
-
 Subgroup analysis: favourites vs non-favourites
 ```{r}
 subgroup_results <- match_test_eval %>%
@@ -463,19 +460,6 @@ mean(bets_main$profit, na.rm = TRUE)
 nrow(bets_main)
 ```
 
-Betting strategy: median split
-```{r}
-bets_total_goals <- match_test_eval %>%
-  filter(
-    fair_home > 0.4 & fair_home < 0.6,
-    lambda_sum_nb > median(lambda_sum_nb, na.rm = TRUE)
-  ) %>%
-  add_profit()
-
-mean(bets_total_goals$profit, na.rm = TRUE)
-nrow(bets_total_goals)
-```
-
 Betting strategy: top 40 percent
 ```{r}
 bets_top40 <- match_test_eval %>%
@@ -488,7 +472,6 @@ bets_top40 <- match_test_eval %>%
 mean(bets_top40$profit, na.rm = TRUE)
 nrow(bets_top40)
 ```
-
 Betting strategy: top 30 percent
 ```{r}
 bets_stricter <- match_test_eval %>%
@@ -550,7 +533,7 @@ sample_size_checks <- tibble(
 
 print(sample_size_checks)
 ```
-Robustness across all expected-goal cutoffs
+Robustness across expected-goal decile cutoffs
 ```{r}
 robustness_cutoffs <- seq(0.1, 0.9, by = 0.1)
 
@@ -767,6 +750,6 @@ t.test(bets_wider$profit)
 ```
 Save rds
 ```{r}
-saveRDS(match_test_eval, "pl_match_test_eval.rds")
+saveRDS(match_test_eval, "sa_match_test_eval.rds")
 ```
 

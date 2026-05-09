@@ -234,7 +234,7 @@ test_df <- test_df %>%
   mutate(pred_xgb = predict(xgb_model, test_matrix))
 ```
 
-Convert teaam-level predictions to match-level rows: train
+Convert team-level predictions to match-level rows: train
 ```{r}
 home_train <- train_df %>%
   filter(home_flag == 1) %>%
@@ -473,19 +473,6 @@ mean(bets_main$profit, na.rm = TRUE)
 nrow(bets_main)
 ```
 
-Betting strategy: median split
-```{r}
-bets_total_goals <- match_test_eval %>%
-  filter(
-    fair_home > 0.4 & fair_home < 0.6,
-    lambda_sum_nb > median(lambda_sum_nb, na.rm = TRUE)
-  ) %>%
-  add_profit()
-
-mean(bets_total_goals$profit, na.rm = TRUE)
-nrow(bets_total_goals)
-```
-
 Betting strategy: top 40 percent
 ```{r}
 bets_top40 <- match_test_eval %>%
@@ -560,7 +547,7 @@ sample_size_checks <- tibble(
 
 print(sample_size_checks)
 ```
-Robustness across all expected-goal cutoffs
+Robustness across expected-goal decile cutoffs
 ```{r}
 robustness_cutoffs <- seq(0.1, 0.9, by = 0.1)
 

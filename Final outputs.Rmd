@@ -17,6 +17,7 @@ library(purrr)
 library(lubridate)
 library(gt)
 library(scales)
+library(forecast)
 
 fix_bad_years <- function(x) {
   x <- as.Date(x)
@@ -128,8 +129,6 @@ forecast_performance_table %>%
 ```
 Diebold-Mariano test
 ```{r}
-library(forecast)
-
 dm_nb <- dm.test(
   e1 = (pooled$home_win.y - pooled$p_home_nb)^2,
   e2 = (pooled$home_win.y - pooled$fair_home)^2,
@@ -255,7 +254,7 @@ league_heterogeneity_table %>%
     column_labels.font.weight = "bold"
   )
 ```
-Robustness across expected-goal percentiles
+Robustness across expected-goal decile cutoffs
 ```{r}
 robustness_cutoff_table <- robustness_table_pooled %>%
   mutate(
